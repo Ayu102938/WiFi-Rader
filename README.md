@@ -15,6 +15,9 @@
 > - 2026-10-24: Created `examples/get-started/tools/csi_motion_detector.py`, a
 >   real-time human-presence detector with per-packet normalization, automatic
 >   calibration, EMA smoothing, hysteresis, and metrics CSV output.
+> - 2026-10-24: Created `examples/get-started/tools/csi_occupancy_meter.py`, a
+>   three-level occupancy classifier that uses both motion magnitude and
+>   fluctuation frequency to distinguish empty / one person / multiple people.
 > - 2026-10-24: Rewrote this `README.md` as a setup guide for the WiFi-Rader
 >   project.
 >
@@ -29,6 +32,9 @@
 > - 2026-10-24: リアルタイム在否検出スクリプト
 >   `examples/get-started/tools/csi_motion_detector.py` を新規作成。
 >   振幅正規化、自動キャリブレーション、EMA 平滑化、ヒステリシス、metrics CSV 出力を実装。
+> - 2026-10-24: 3 段階混雑度分類スクリプト
+>   `examples/get-started/tools/csi_occupancy_meter.py` を新規作成。
+>   動きの大きさと変動頻度を組み合わせて、無人 / 1人 / 複数人を判定。
 > - 2026-10-24: 本 `README.md` を WiFi-Rader プロジェクトのセットアップガイドとして全面改稿。
 
 ---
@@ -298,6 +304,73 @@ Columns / 列:
 | `baseline_sigma` | アイドル基線の標準偏差 |
 | `threshold_on` | 有人に移行する閾値 |
 | `threshold_off` | 無人に戻る閾値 |
+
+---
+
+## 3-Level Occupancy Meter / 3 段階混雑度メーター
+
+For a richer estimate than binary presence/absence, use `csi_occupancy_meter.py`.
+It combines the existing motion score with an **activity score** that measures
+how frequently the motion score fluctuates. This gives a three-level estimate:
+
+| Level | Meaning |
+|-------|---------|
+| 無人 | Empty room |
+| 1人（小動き） | One person, steady movement |
+| 複数人（ざわざわ） | Multiple people or bustling activity |
+
+在否検出よりも細かい情報が欲しい場合は `csi_occupancy_meter.py` を使います。
+既存の動きスコアに加えて、スコアの変動頻度を表す **アクティビティスコア** を
+組み合わせることで、3 段階の混雑度を推定します。
+
+| 段階 | 意味 |
+|------|------|
+| 無人 | 部屋に誰もいない |
+| 1人（小動き） | 1 人が規則的に動いている |
+| 複数人（ざわざわ） | 複数人または活発な動き |
+
+### Run / 実行
+
+```bash
+uv run python csi_occupancy_meter.py -p /dev/ttyACM0 --metrics-csv occupancy.csv
+```
+
+### Activity metrics / アクティビティ指標
+
+Choose the fluctuation metric with `--activity-metric`:
+
+| Metric | Description |
+|--------|-------------|
+| `cv` (default) | Coefficient of variation: std / mean of motion score over the activity window. Scale-free. |
+| `diff` | Standard deviation of first differences of motion score. |
+| `peaks` | Local maxima of motion score per second above `mean + 1σ`. |
+
+`--activity-metric` で変動の測り方を選べます:
+
+| 指標 | 説明 |
+|------|------|
+| `cv`（デフォルト） | 変動係数（標準偏差 ÷ 平均）。スケールに依存しない。 |
+| `diff` | 動きスコアの 1 階差分の標準偏差。 |
+| `peaks` | 1 秒あたりの局所的最大値の数（`平均 + 1σ` 以上）。 |
+
+### Example / 例
+
+```bash
+# Use the diff metric with an explicit threshold
+# diff 指標を使い、閾値を明示的に指定
+uv run python csi_occupancy_meter.py -p /dev/ttyACM0 \
+  --activity-metric diff --activity-threshold 0.2 \
+  --metrics-csv occupancy.csv
+```
+
+### Important limitation / 重要な制限
+
+This is an **activity-level estimator**, not a people counter.
+A single person moving vigorously can look like multiple people, and several
+people standing still can look like an empty room.
+
+これは **活動度の推定** であり、正確な人数計測ではありません。
+1 人が激しく動けば複数人に見えるし、複数人が静止していれば無人に見えることがあります。
 
 ---
 
