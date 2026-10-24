@@ -391,9 +391,7 @@ See [LICENSE](./LICENSE) for the full text.
 ## Contributing / 貢献
 
 If you modify existing files, please add a modification notice near the top of
-the file to comply with Apache License 2.0 Section 4(b). The
-`apache-notice-helper` OpenCode skill can assist with this.
+the file to comply with Apache License 2.0 Section 4(b).
 
 既存ファイルを変更する場合、Apache License 2.0 第 4 条 (b) に従い、
-ファイル先頭に変更通知を追加してください。OpenCode の `apache-notice-helper`
-スキルが手助けします。
+ファイル先頭に変更通知を追加してください。
