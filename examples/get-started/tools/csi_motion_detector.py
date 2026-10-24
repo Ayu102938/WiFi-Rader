@@ -4,6 +4,14 @@
 # SPDX-FileCopyrightText: 2021-2025 Espressif Systems (Shanghai) CO LTD
 # SPDX-License-Identifier: Apache-2.0
 #
+# Modified by Ayu102938
+#
+# This file is derived from examples/get-started/tools/csi_data_read_parse.py.
+# Changes:
+# - 2026-10-24: Created a GUI-free real-time presence detector.
+# - Added per-packet amplitude normalization, coefficient-of-variation style score,
+#   auto-calibration, EMA smoothing, hysteresis, and per-packet metrics CSV output.
+#
 """Real-time human presence detection from ESP-CSI serial output.
 
 Reads ``CSI_DATA`` lines from a serial port, converts the raw interleaved

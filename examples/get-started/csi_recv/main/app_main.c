@@ -3,6 +3,14 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+/*
+ * Modified by Ayu102938
+ *
+ * - 2026-10-23: Disabled compensate_gain log output in wifi_csi_cb() to prevent
+ *   the Python parser from crashing on interleaved log lines.
+ * - 2026-10-24: Enabled CONFIG_FORCE_GAIN to stabilize AGC/FFT gains and reduce
+ *   idle amplitude variance for presence detection.
+ */
 /* Get Start Example
 
    This example code is in the Public Domain (or CC0 licensed, at your option.)
