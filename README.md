@@ -18,6 +18,8 @@
 > - 2026-10-24: Created `examples/get-started/tools/csi_occupancy_meter.py`, a
 >   three-level occupancy classifier that uses both motion magnitude and
 >   fluctuation frequency to distinguish empty / one person / multiple people.
+> - 2026-10-24: Created `examples/get-started/tools/csi_proximity_meter.py`, a
+>   coarse approach/departure detector based on absolute CSI energy trends.
 > - 2026-10-24: Rewrote this `README.md` as a setup guide for the WiFi-Rader
 >   project.
 >
@@ -35,6 +37,9 @@
 > - 2026-10-24: 3 段階混雑度分類スクリプト
 >   `examples/get-started/tools/csi_occupancy_meter.py` を新規作成。
 >   動きの大きさと変動頻度を組み合わせて、無人 / 1人 / 複数人を判定。
+> - 2026-10-24: 近接方向推定スクリプト
+>   `examples/get-started/tools/csi_proximity_meter.py` を新規作成。
+>   絶対エネルギーの時間変化から、近づいている / 遠ざかっている / 静止 を判定。
 > - 2026-10-24: 本 `README.md` を WiFi-Rader プロジェクトのセットアップガイドとして全面改稿。
 
 ---
@@ -371,6 +376,60 @@ people standing still can look like an empty room.
 
 これは **活動度の推定** であり、正確な人数計測ではありません。
 1 人が激しく動けば複数人に見えるし、複数人が静止していれば無人に見えることがあります。
+
+---
+
+## Approach / Departure Detection / 近づく・遠ざかる検出
+
+`csi_proximity_meter.py` tracks the **absolute received energy** (not the
+normalized motion score). When a person approaches the link, the received power
+generally rises; when they move away, it falls.
+
+`csi_proximity_meter.py` は **正規化していない受信エネルギー** を追跡します。
+人が TX-RX 間に近づくと受信電力が上がり、遠ざかると下がる傾向を利用して
+方向を推定します。
+
+### Run / 実行
+
+```bash
+uv run python csi_proximity_meter.py -p /dev/ttyACM0 --metrics-csv proximity.csv
+```
+
+### Output / 出力
+
+| Direction | Meaning |
+|-----------|---------|
+| `近づいている` | Energy is rising (approaching) |
+| `遠ざかっている` | Energy is falling (moving away) |
+| `静止` | Energy is stable |
+
+| 方向 | 意味 |
+|------|------|
+| `近づいている` | エネルギーが上昇（近づいている） |
+| `遠ざかっている` | エネルギーが下降（遠ざかっている） |
+| `静止` | エネルギーが安定 |
+
+### Options / オプション
+
+```bash
+# Use amplitude instead of power
+# パワーではなく振幅でエネルギーを計算
+uv run python csi_proximity_meter.py -p /dev/ttyACM0 --energy-metric amplitude
+
+# Slower, steadier trend
+# よりゆっくり安定したトレンド
+uv run python csi_proximity_meter.py -p /dev/ttyACM0 --trend-window 3.0 --ema-alpha 0.1
+```
+
+### Important limitation / 重要な制限
+
+This is a **coarse proximity-direction estimator**. Multipath reflections can
+make energy decrease even when a person is approaching, so it looks at
+low-frequency trends over seconds, not instant-by-instant changes.
+
+これは **おおまかな近接方向推定** です。
+マルチパス反射の影響で、近づいていても一時的にエネルギーが減ることがあるため、
+瞬間的な変化ではなく秒単位の低周波トレンドを見ます。
 
 ---
 
