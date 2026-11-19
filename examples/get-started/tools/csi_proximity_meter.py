@@ -6,12 +6,15 @@
 #
 # Modified by Ayu102938
 # - 2026-10-24: Created csi_proximity_meter.py for approach/departure detection.
+# - 2026-11-19: Moved the CSI front end (line parsing, subcarrier selection,
+#   serial handling, read loop, CSV layout) to the shared csi_common module;
+#   only the absolute-energy trend stays here.
 #
 # This file is derived from examples/get-started/tools/csi_occupancy_meter.py and
-# csi_motion_detector.py.  The CSI parser, subcarrier selection and CSV layout
-# are copied verbatim so the three tools stay comparable, while this script
-# looks at the *absolute* (unnormalized) energy trend instead of a gain-
-# normalized motion score.
+# csi_motion_detector.py.  It shares the CSI front end through csi_common and
+# keeps its own CSV layout so the three tools stay comparable, while it looks
+# at the *absolute* (unnormalized) energy trend instead of a gain-normalized
+# motion score.
 #
 """Coarse approach/departure detection from ESP-CSI serial output.
 
@@ -72,33 +75,20 @@ Usage::
     python csi_proximity_meter.py -p /dev/ttyACM0 \
         --csv csi_capture.csv --metrics-csv proximity.csv
 
-Requires only ``pyserial`` and ``numpy`` (both in requirements.txt).
+Requires only ``pyserial`` and ``numpy`` (see requirements.txt).
 """
 
 import argparse
 import csv
-import json
 import sys
 import time
 from collections import deque
-from io import StringIO
 
 import numpy as np
-import serial
 
-# Column layouts emitted by the ESP-CSI receiver firmwares.
-DATA_COLUMNS_NAMES_C5C6 = [
-    'type', 'id', 'mac', 'rssi', 'rate', 'noise_floor', 'fft_gain',
-    'agc_gain', 'channel', 'local_timestamp', 'sig_len', 'rx_state',
-    'len', 'first_word', 'data',
-]
-DATA_COLUMNS_NAMES = [
-    'type', 'id', 'mac', 'rssi', 'rate', 'sig_mode', 'mcs', 'bandwidth',
-    'smoothing', 'not_sounding', 'aggregation', 'stbc', 'fec_coding',
-    'sgi', 'noise_floor', 'ampdu_cnt', 'channel', 'secondary_channel',
-    'local_timestamp', 'ant', 'sig_len', 'rx_state', 'len', 'first_word',
-    'data',
-]
+from csi_common import (Ema, PacketStats, Progress, SerialOpenError,
+                        SubcarrierSelector, csv_header, fmt_opt,
+                        iter_csi_packets, open_serial)
 
 METRICS_COLUMNS = [
     'timestamp', 'packet_num', 'energy', 'smoothed_energy', 'trend',
@@ -124,90 +114,6 @@ TREND_FALLBACK_RELATIVE = 0.01
 # Calibration needs a few trend samples on top of the elapsed time.
 MIN_TREND_SAMPLES = 5
 MIN_ENERGY_SAMPLES = 20
-
-
-def parse_csi_line(line):
-    """Parse one serial line into ``(row, amplitude, rssi)``.
-
-    Returns ``None`` for anything that is not a complete, well-formed
-    ``CSI_DATA`` record.  Malformed input is expected on a live serial
-    link (boot messages, truncated reads), so callers simply skip it.
-    """
-    if 'CSI_DATA' not in line:
-        return None
-
-    try:
-        row = next(csv.reader(StringIO(line)))
-    except (csv.Error, StopIteration):
-        return None
-
-    if len(row) not in (len(DATA_COLUMNS_NAMES), len(DATA_COLUMNS_NAMES_C5C6)):
-        return None
-
-    try:
-        csi_len = int(row[-3])
-        raw = json.loads(row[-1])
-    except (ValueError, IndexError, json.JSONDecodeError):
-        return None
-
-    if not isinstance(raw, list) or csi_len != len(raw):
-        return None
-
-    # The firmware interleaves imaginary then real parts: [Q, I, Q, I, ...]
-    n_pairs = len(raw) // 2
-    if n_pairs == 0:
-        return None
-    samples = np.asarray(raw[:n_pairs * 2], dtype=np.float64).reshape(n_pairs, 2)
-    amplitude = np.hypot(samples[:, 0], samples[:, 1])
-
-    try:
-        rssi = int(row[3])
-    except (ValueError, IndexError):
-        rssi = 0
-
-    return row, amplitude, rssi
-
-
-def parse_subcarrier_spec(spec, count):
-    """Turn ``"0-12,20,30-40"`` into an index array clipped to ``count``."""
-    if not spec:
-        return np.arange(count)
-
-    indexes = set()
-    for part in spec.split(','):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            if '-' in part:
-                start, end = part.split('-', 1)
-                indexes.update(range(int(start), int(end) + 1))
-            else:
-                indexes.add(int(part))
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                'invalid subcarrier specification: %r' % spec)
-
-    valid = sorted(i for i in indexes if 0 <= i < count)
-    if not valid:
-        return np.arange(count)
-    return np.asarray(valid, dtype=np.int64)
-
-
-def select_subcarriers(count, spec, edge_skip):
-    """Choose the subcarrier indexes used for the energy estimate.
-
-    An explicit ``--subcarriers`` specification wins.  Otherwise the first and
-    last ``edge_skip`` subcarriers are dropped, because guard, DC and null
-    subcarriers carry little useful signal and mostly add noise.
-    """
-    if spec:
-        return parse_subcarrier_spec(spec, count)
-
-    skip = max(0, min(edge_skip, (count - 1) // 2))
-    if skip == 0 or count - 2 * skip < 1:
-        return np.arange(count)
-    return np.arange(skip, count - skip)
 
 
 def compute_energy(amplitude, index, metric):
@@ -270,21 +176,6 @@ def build_arg_parser():
     parser.add_argument('--metrics-csv', default=None,
                         help='optional path to write per-packet metrics as CSV')
     return parser
-
-
-class Ema:
-    """Exponential moving average with warm-up on the first sample."""
-
-    def __init__(self, alpha):
-        self.alpha = alpha
-        self.value = None
-
-    def update(self, sample):
-        if self.value is None:
-            self.value = sample
-        else:
-            self.value = self.alpha * sample + (1.0 - self.alpha) * self.value
-        return self.value
 
 
 class TrendTracker:
@@ -403,32 +294,6 @@ class Calibration:
         return max(TREND_FALLBACK_RELATIVE * abs(energy_mu), 1e-9), True
 
 
-class Progress:
-    """Rate-limited ``\\r`` progress line so a piped log does not explode."""
-
-    def __init__(self, interval=0.1):
-        self.interval = interval
-        self.last = 0.0
-
-    def show(self, text):
-        now = time.monotonic()
-        if now - self.last < self.interval:
-            return
-        self.last = now
-        print('\r' + text.ljust(88), end='', flush=True)
-
-    def force(self, text):
-        self.last = time.monotonic()
-        print('\r' + text.ljust(88), end='', flush=True)
-
-
-def fmt_opt(value):
-    """Format a float for CSV, or an empty field when it is undefined."""
-    if value is None or not np.isfinite(value):
-        return ''
-    return '%.6f' % value
-
-
 def classify(trend, threshold):
     if trend > threshold:
         return DIR_APPROACHING
@@ -457,10 +322,9 @@ def main(argv=None):
         return 2
 
     try:
-        ser = serial.Serial(port=args.port, baudrate=args.baud, bytesize=8,
-                            parity='N', stopbits=1, timeout=1)
-    except serial.SerialException as exc:
-        print('error: cannot open %s: %s' % (args.port, exc), file=sys.stderr)
+        ser = open_serial(args.port, args.baud)
+    except SerialOpenError as exc:
+        print('error: %s' % exc, file=sys.stderr)
         return 1
 
     csv_file = None
@@ -477,18 +341,14 @@ def main(argv=None):
         metrics_writer.writerow(METRICS_COLUMNS)
         metrics_file.flush()
 
-    index_cache = {}
-    window_len = None
-    packets = 0
-    scored = 0
-    skipped = 0
-    other_lines = 0
+    selector = SubcarrierSelector(args.subcarriers, args.edge_skip)
+    stats = PacketStats()
 
     ema = Ema(args.ema_alpha)
     tracker = TrendTracker(args.trend_window)
     calibration = Calibration(
         args.calib, grace=max(2.0 * args.trend_window, 2.0))
-    progress = Progress()
+    progress = Progress(interval=0.1)
 
     energy_mu = energy_sigma = float('nan')
     trend_threshold = float('nan')
@@ -507,9 +367,8 @@ def main(argv=None):
           % (DIR_APPROACHING, DIR_AWAY, DIR_STATIONARY))
 
     try:
-        while True:
-            line = ser.readline()
-            if not line:
+        for packet in iter_csi_packets(ser, stats):
+            if packet is None:
                 if not calibrated:
                     elapsed, fraction = calibration.progress()
                     progress.show(
@@ -519,58 +378,36 @@ def main(argv=None):
                            len(calibration.energies),
                            len(calibration.trends)))
                 continue
-            # A read interrupted by the timeout may return a partial line.
-            if not line.endswith(b'\n'):
-                skipped += 1
-                continue
 
-            text = line.decode('utf-8', errors='ignore').strip('\r\n')
-            parsed = parse_csi_line(text)
-            if parsed is None:
-                # Firmware logs and boot banners are not CSI records.
-                if 'CSI_DATA' in text:
-                    skipped += 1
-                else:
-                    other_lines += 1
-                continue
-
-            row, amplitude, rssi = parsed
-            packets += 1
+            row, amplitude, rssi = packet
             timestamp = time.time()
             now = time.monotonic()
 
             if csv_writer is not None:
-                if packets == 1:
-                    csv_writer.writerow(
-                        DATA_COLUMNS_NAMES if len(row) == len(DATA_COLUMNS_NAMES)
-                        else DATA_COLUMNS_NAMES_C5C6)
+                if stats.packets == 1:
+                    csv_writer.writerow(csv_header(row))
                 csv_writer.writerow(row)
                 csv_file.flush()
 
+            try:
+                index = selector.indexes(amplitude.shape[0])
+            except argparse.ArgumentTypeError as exc:
+                print('\nerror: %s' % exc, file=sys.stderr)
+                return 2
             # A changed subcarrier count means the radio re-tuned.  The energy
             # scale changes with it, so restart the smoothing and the trend
             # history instead of reporting a fake jump.
-            if window_len is not None and amplitude.shape[0] != window_len:
+            if selector.changed:
                 ema = Ema(args.ema_alpha)
                 tracker.clear()
-            window_len = amplitude.shape[0]
-
-            if window_len not in index_cache:
-                try:
-                    index_cache[window_len] = select_subcarriers(
-                        window_len, args.subcarriers, args.edge_skip)
-                except argparse.ArgumentTypeError as exc:
-                    print('\nerror: %s' % exc, file=sys.stderr)
-                    return 2
-            index = index_cache[window_len]
 
             energy = compute_energy(amplitude, index, args.energy_metric)
             if energy is None:
-                skipped += 1
+                stats.skipped += 1
                 continue
 
             smoothed = ema.update(energy)
-            scored += 1
+            stats.scored += 1
             last_energy = energy
             tracker.append(now, smoothed)
             trend = tracker.trend()
@@ -584,7 +421,7 @@ def main(argv=None):
                 if metrics_writer is not None:
                     fixed = fmt_opt(args.threshold) if args.threshold else ''
                     metrics_writer.writerow([
-                        '%.3f' % timestamp, packets,
+                        '%.3f' % timestamp, stats.packets,
                         fmt_opt(energy), fmt_opt(smoothed), fmt_opt(trend),
                         DIR_CALIBRATING, rssi, '', '', fixed,
                     ])
@@ -627,7 +464,7 @@ def main(argv=None):
 
             if metrics_writer is not None:
                 metrics_writer.writerow([
-                    '%.3f' % timestamp, packets,
+                    '%.3f' % timestamp, stats.packets,
                     fmt_opt(energy), fmt_opt(smoothed), fmt_opt(trend),
                     direction, rssi, fmt_opt(energy_mu),
                     fmt_opt(energy_sigma), fmt_opt(trend_threshold),
@@ -638,12 +475,10 @@ def main(argv=None):
                 '%s  energy=%.2f  trend=%s  rssi=%d  packets=%d'
                 % (direction, smoothed,
                    '-' if trend is None else '%+.2f' % trend,
-                   rssi, packets))
+                   rssi, stats.packets))
 
     except KeyboardInterrupt:
-        print('\nstopped: %d packets parsed (%d scored), %d lines skipped, '
-              '%d log lines ignored'
-              % (packets, scored, skipped, other_lines))
+        print('\nstopped: %s' % stats.summary())
     finally:
         ser.close()
         if csv_file is not None:
