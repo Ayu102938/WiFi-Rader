@@ -1,9 +1,14 @@
-# Python dependencies for csi_data_read_parse.py
+# Python dependencies for csi_data_read_parse.py (the GUI viewer)
 # Install with: pip install -r requirements.txt
+#
+# The headless detectors (csi_motion_detector.py, csi_occupancy_meter.py,
+# csi_proximity_meter.py) only need numpy and pyserial.
 
 # Data processing
 numpy
 pandas
+scipy
+statsmodels
 
 # Serial communication
 pyserial
@@ -14,7 +19,3 @@ PyQt5
 # Scientific plotting
 pyqtgraph
 matplotlib
-
-# Scientific computing
-scipy
-statsmodels
