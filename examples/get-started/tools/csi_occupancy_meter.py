@@ -9,6 +9,9 @@
 # - 2026-11-19: Moved the CSI front end (line parsing, subcarrier selection,
 #   amplitude normalization, serial handling, read loop) to the shared
 #   csi_common module; only the motion/activity statistics stay here.
+# - 2026-11-19: Moved those statistics and the occupancy state machine to
+#   csi_detectors.OccupancyMeter so the web UI can drive the same detector; this
+#   script now only parses arguments and prints results.
 #
 # This file is derived from examples/get-started/tools/csi_motion_detector.py.
 # The motion score is computed exactly as in that tool so the two stay
@@ -91,92 +94,12 @@ import argparse
 import csv
 import sys
 import time
-from collections import deque
 
-import numpy as np
-
-from csi_common import (Ema, PacketStats, Progress, SerialOpenError,
-                        SubcarrierSelector, csv_header, fmt_opt,
-                        iter_csi_packets, normalize_amplitude, open_serial)
-
-METRICS_COLUMNS = [
-    'timestamp', 'packet_num', 'motion_score', 'smoothed_motion',
-    'activity_score', 'activity_metric', 'occupancy_level', 'rssi',
-    'baseline_mu', 'baseline_sigma', 'motion_threshold_on',
-    'motion_threshold_off', 'activity_threshold',
-]
-
-LEVEL_EMPTY = '無人'
-LEVEL_SINGLE = '1人（小動き）'
-LEVEL_MULTI = '複数人（ざわざわ）'
-LEVEL_CALIBRATING = 'CALIBRATING'
-
-ACTIVITY_METRICS = ('cv', 'diff', 'peaks')
-
-# Activity levels flip only after this many consecutive packets on one side.
-ACTIVITY_HYSTERESIS_PACKETS = 3
-
-# Floor for the auto-calibrated activity threshold: prevents a perfectly still
-# empty room (activity_sigma == 0) from classifying every packet as 複数人.
-# ``cv`` is dimensionless and ``peaks`` is in peaks/second, so 0.1 is a sensible
-# floor for both.  ``diff`` has motion-score units, where 0.1 would be far above
-# any real first-difference spread, so it only needs a tiny epsilon guard.
-ACTIVITY_THRESHOLD_FLOORS = {
-    'cv': 0.1,
-    'diff': 1e-9,
-    'peaks': 0.1,
-}
-
-# Baseline activity is only sampled once the activity buffer is nearly full,
-# otherwise the statistic is measured over a shorter span than the one used at
-# run time (this biases ``peaks`` and ``diff`` low, sometimes to zero).
-MIN_ACTIVITY_SAMPLES = 5
-BASELINE_ACTIVITY_WINDOW_FRACTION = 0.8
-
-
-def compute_activity(samples, metric, window_seconds):
-    """Compute the activity score from ``(monotonic_time, motion)`` samples.
-
-    ``samples`` is an oldest-first sequence already trimmed to the activity
-    window.  Returns ``None`` while there is not enough history for the chosen
-    metric, so callers can hold the previous classification.
-    """
-    if len(samples) < MIN_ACTIVITY_SAMPLES:
-        return None
-
-    values = np.asarray([value for _, value in samples], dtype=np.float64)
-    if not np.all(np.isfinite(values)):
-        return None
-
-    span = float(samples[-1][0] - samples[0][0])
-
-    if metric == 'cv':
-        mean = float(values.mean())
-        if mean <= 1e-9:
-            return None
-        return float(values.std()) / mean
-
-    if metric == 'diff':
-        if values.size < 2:
-            return None
-        return float(np.diff(values).std())
-
-    if metric == 'peaks':
-        if values.size < 3:
-            return None
-        # Strict local maxima, but only "significant" ones: without the
-        # prominence guard every 2-sample wiggle counts and the metric
-        # saturates at sampling rate / 3 regardless of real activity.
-        mean = float(values.mean())
-        level = mean + float(values.std())
-        middle = values[1:-1]
-        local = (middle > values[:-2]) & (middle > values[2:]) & (middle >= level)
-        peaks = int(np.count_nonzero(local))
-        duration = span if span > 1e-6 else max(window_seconds, 1e-6)
-        return peaks / duration
-
-    return None
-
+from csi_common import (PacketStats, Progress, SerialOpenError, csv_header,
+                        iter_csi_packets, open_serial)
+from csi_detectors import (ACTIVITY_METRICS, LEVEL_CALIBRATING,
+                           LEVEL_EMPTY, LEVEL_MULTI, LEVEL_SINGLE,
+                           OccupancyMeter)
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
@@ -223,77 +146,19 @@ def build_arg_parser():
     return parser
 
 
-class Calibration:
-    """Collects empty-room motion and activity scores and derives thresholds."""
-
-    def __init__(self, seconds, min_packets):
-        self.seconds = seconds
-        self.min_packets = min_packets
-        self.scores = []
-        self.activity_scores = []
-        self.start = None
-
-    def start_now(self):
-        if self.start is None:
-            self.start = time.monotonic()
-
-    def add(self, score):
-        self.start_now()
-        self.scores.append(score)
-
-    def add_activity(self, score):
-        self.activity_scores.append(score)
-
-    def progress(self):
-        """Return ``(elapsed, fraction)`` for the calibration progress line."""
-        elapsed = 0.0 if self.start is None else time.monotonic() - self.start
-        fraction = 0.0
-        if self.seconds > 0:
-            fraction = min(1.0, elapsed / self.seconds)
-        return elapsed, fraction
-
-    def done(self):
-        if self.start is None:
-            return False
-        elapsed = time.monotonic() - self.start
-        return elapsed >= self.seconds and len(self.scores) >= self.min_packets
-
-    def motion_result(self, on_sigma, off_sigma):
-        """Return ``(mu, sigma, threshold_on, threshold_off)`` for motion.
-
-        The smoothed score is used as the statistic, so sigma reflects the
-        noise of the value that is actually compared against the thresholds.
-        A floor keeps thresholds above the baseline in degenerate cases
-        (a perfectly still window would otherwise give sigma == 0).
-        """
-        arr = np.asarray(self.scores, dtype=np.float64)
-        mu = float(arr.mean()) if arr.size else 0.0
-        sigma = float(arr.std()) if arr.size else 0.0
-        # Guard against a zero/near-zero sigma: assume at least 2% relative jitter.
-        sigma = max(sigma, abs(mu) * 0.02, 1e-6)
-        return mu, sigma, mu + on_sigma * sigma, mu + off_sigma * sigma
-
-    def activity_result(self, metric='cv'):
-        """Return ``(mu, sigma, threshold)`` for the activity score.
-
-        The floor depends on the metric: ``cv`` and ``peaks`` are floored at
-        0.1, while ``diff`` lives in motion-score units and only gets a tiny
-        epsilon guard so a degenerate baseline cannot force 複数人.
-        """
-        arr = np.asarray(self.activity_scores, dtype=np.float64)
-        mu = float(arr.mean()) if arr.size else 0.0
-        sigma = float(arr.std()) if arr.size else 0.0
-        floor = ACTIVITY_THRESHOLD_FLOORS.get(metric, 0.1)
-        threshold = max(mu + 3.0 * sigma, floor)
-        return mu, sigma, threshold
-
-
-def activity_window_ready(samples, window_seconds):
-    """True once the activity buffer covers most of the activity window."""
-    if len(samples) < MIN_ACTIVITY_SAMPLES:
-        return False
-    span = samples[-1][0] - samples[0][0]
-    return span >= BASELINE_ACTIVITY_WINDOW_FRACTION * window_seconds
+def show_calibration(progress, detector, metrics=None):
+    """Print the rate-limited calibration line (time, packets, both scores)."""
+    elapsed, fraction, samples = detector.calibration_progress()
+    extra = ''
+    if metrics is not None:
+        extra = (', motion=%s, activity=%s'
+                 % ('-' if metrics['smoothed'] is None
+                    else '%.4f' % metrics['smoothed'],
+                    '-' if metrics['activity'] is None
+                    else '%.2f' % metrics['activity']))
+    progress.show('キャリブレーション中... %4.1f/%4.1fs (%3d%%, %d packets%s)'
+                  % (elapsed, detector.calibration.seconds,
+                     int(fraction * 100), samples, extra))
 
 
 def main(argv=None):
@@ -342,29 +207,19 @@ def main(argv=None):
     if args.metrics_csv:
         metrics_file = open(args.metrics_csv, 'w', newline='')
         metrics_writer = csv.writer(metrics_file)
-        metrics_writer.writerow(METRICS_COLUMNS)
+        metrics_writer.writerow(OccupancyMeter.columns)
         metrics_file.flush()
 
-    window = deque(maxlen=args.window)
-    # Timestamped motion scores; bounded so a long run cannot grow the buffer.
-    activity = deque(maxlen=max(64, int(args.activity_window * 1000)))
-    selector = SubcarrierSelector(args.subcarriers, args.edge_skip)
+    detector = OccupancyMeter(
+        window=args.window, calib=args.calib,
+        calib_min_packets=args.calib_min_packets, ema_alpha=args.ema_alpha,
+        on_sigma=args.on_sigma, off_sigma=args.off_sigma,
+        activity_window=args.activity_window,
+        activity_metric=args.activity_metric,
+        activity_threshold=args.activity_threshold,
+        subcarriers=args.subcarriers, edge_skip=args.edge_skip)
     stats = PacketStats()
-
-    ema = Ema(args.ema_alpha)
-    calibration = Calibration(args.calib, args.calib_min_packets)
     progress = Progress()
-
-    mu = sigma = float('nan')
-    threshold_on = threshold_off = float('nan')
-    activity_mu = activity_sigma = float('nan')
-    activity_threshold = args.activity_threshold
-    calibrated = False
-
-    occupied = False
-    activity_high = False
-    above_count = 0
-    below_count = 0
 
     print('Listening on %s @ %d baud (window=%d, activity-window=%.1fs, '
           'activity-metric=%s, ema-alpha=%.2f)'
@@ -378,17 +233,12 @@ def main(argv=None):
     try:
         for packet in iter_csi_packets(ser, stats):
             if packet is None:
-                if not calibrated:
-                    elapsed, fraction = calibration.progress()
-                    progress.show(
-                        'キャリブレーション中... %4.1f/%4.1fs (%3d%%, %d packets)'
-                        % (elapsed, calibration.seconds, int(fraction * 100),
-                           len(calibration.scores)))
+                if not detector.calibrated:
+                    show_calibration(progress, detector)
                 continue
 
             row, amplitude, rssi = packet
             timestamp = time.time()
-            now = time.monotonic()
 
             if csv_writer is not None:
                 if stats.packets == 1:
@@ -397,156 +247,56 @@ def main(argv=None):
                 csv_file.flush()
 
             try:
-                index = selector.indexes(amplitude.shape[0])
+                metrics = detector.update(amplitude, rssi)
             except argparse.ArgumentTypeError as exc:
                 print('\nerror: %s' % exc, file=sys.stderr)
                 return 2
-            # A changed subcarrier count means the radio re-tuned; restart.
-            if selector.changed:
-                window.clear()
-                activity.clear()
-
-            normalized = normalize_amplitude(amplitude, index)
-            if normalized is None:
+            if metrics is None:
                 stats.skipped += 1
                 continue
-            window.append(normalized)
-
-            motion_score = None
-            if len(window) >= 2:
-                stack = np.asarray(window)
-                variance = stack.var(axis=0)
-                # Scale-free score: variance of the gain-normalized amplitude,
-                # averaged over the selected subcarriers.
-                motion_score = float(variance.mean())
-                ema.update(motion_score)
+            if metrics['score'] is not None:
                 stats.scored += 1
 
-            # The activity statistic is only meaningful on steady-state
-            # windows; a partially filled window has inflated variance.
-            steady = motion_score is not None and len(window) >= args.window
-            if steady:
-                activity.append((now, motion_score))
-                while activity and now - activity[0][0] > args.activity_window:
-                    activity.popleft()
-
-            activity_score = None
-            if steady and activity_window_ready(activity, args.activity_window):
-                activity_score = compute_activity(
-                    activity, args.activity_metric, args.activity_window)
-
-            smoothed = ema.value
-
-            if not calibrated:
-                # The idle clock starts with the first usable score, so the
-                # displayed progress matches wall-clock observation time.
-                if smoothed is not None:
-                    calibration.start_now()
-                    # Only steady-state (full-window) scores feed the baseline;
-                    # short warm-up windows have inflated variance and would
-                    # bias the thresholds upward.
-                    if steady:
-                        calibration.add(smoothed)
-                        if activity_score is not None:
-                            calibration.add_activity(activity_score)
-                elapsed, fraction = calibration.progress()
-
+            if metrics['status'] == LEVEL_CALIBRATING:
                 if metrics_writer is not None:
-                    metrics_writer.writerow([
-                        '%.3f' % timestamp, stats.packets,
-                        fmt_opt(motion_score), fmt_opt(smoothed),
-                        fmt_opt(activity_score), args.activity_metric,
-                        LEVEL_CALIBRATING, rssi,
-                        '', '', '', '',
-                        fmt_opt(args.activity_threshold),
-                    ])
+                    metrics_writer.writerow(
+                        detector.csv_row(metrics, timestamp, stats.packets, rssi))
                     metrics_file.flush()
-
-                progress.show(
-                    'キャリブレーション中... %4.1f/%4.1fs (%3d%%, %d packets, '
-                    'motion=%s, activity=%s)'
-                    % (elapsed, calibration.seconds, int(fraction * 100),
-                       len(calibration.scores),
-                       '-' if smoothed is None else '%.4f' % smoothed,
-                       '-' if activity_score is None else '%.2f' % activity_score))
-
-                if calibration.done():
-                    mu, sigma, threshold_on, threshold_off = \
-                        calibration.motion_result(args.on_sigma, args.off_sigma)
-                    activity_mu, activity_sigma, auto_activity = \
-                        calibration.activity_result(args.activity_metric)
-                    if args.activity_threshold is None:
-                        activity_threshold = auto_activity
-                        threshold_note = ''
-                    else:
-                        threshold_note = ' [override]'
-                    calibrated = True
+                show_calibration(progress, detector, metrics)
+                if metrics['calibrated_now']:
                     print('\nキャリブレーション完了: motion mu=%.4f sigma=%.4f '
                           '-> on=%.4f off=%.4f / activity mu=%.4f sigma=%.4f '
                           '-> threshold=%.4f%s (%d motion, %d activity samples)'
-                          % (mu, sigma, threshold_on, threshold_off,
-                             activity_mu, activity_sigma, activity_threshold,
-                             threshold_note,
-                             len(calibration.scores),
-                             len(calibration.activity_scores)))
+                          % (metrics['mu'], metrics['sigma'],
+                             metrics['threshold_on'], metrics['threshold_off'],
+                             metrics['activity_mu'], metrics['activity_sigma'],
+                             metrics['activity_threshold'],
+                             ' [override]' if args.activity_threshold is not None
+                             else '',
+                             metrics['calib_samples'],
+                             metrics['activity_samples']))
                     if (args.activity_threshold is None
-                            and len(calibration.activity_scores) < 20):
+                            and metrics['activity_samples'] < 20):
                         print('警告: アクティビティのベースラインが十分に取れませんでした '
                               '(%d samples)。--calib を長くするか、'
                               '--activity-threshold を指定してください。'
-                              % len(calibration.activity_scores),
-                              file=sys.stderr)
+                              % metrics['activity_samples'], file=sys.stderr)
                 continue
 
-            if smoothed is None:
+            if metrics['status'] is None:
                 progress.show('収集中... (%d/%d packets)'
-                              % (len(window), args.window))
+                              % (metrics['window_fill'], metrics['window_size']))
                 continue
-
-            # Hysteresis: enter on the high threshold, leave on the low one.
-            if occupied:
-                if smoothed < threshold_off:
-                    occupied = False
-            else:
-                if smoothed >= threshold_on:
-                    occupied = True
-
-            if not occupied:
-                level = LEVEL_EMPTY
-                activity_high = False
-                above_count = below_count = 0
-            else:
-                # Activity level hysteresis: require several consecutive
-                # packets on the new side before switching the label.
-                if activity_score is None:
-                    # Not enough activity history yet; keep the current level.
-                    pass
-                elif activity_score >= activity_threshold:
-                    above_count += 1
-                    below_count = 0
-                    if above_count >= ACTIVITY_HYSTERESIS_PACKETS:
-                        activity_high = True
-                else:
-                    below_count += 1
-                    above_count = 0
-                    if below_count >= ACTIVITY_HYSTERESIS_PACKETS:
-                        activity_high = False
-                level = LEVEL_MULTI if activity_high else LEVEL_SINGLE
 
             if metrics_writer is not None:
-                metrics_writer.writerow([
-                    '%.3f' % timestamp, stats.packets,
-                    fmt_opt(motion_score), fmt_opt(smoothed),
-                    fmt_opt(activity_score), args.activity_metric, level, rssi,
-                    fmt_opt(mu), fmt_opt(sigma),
-                    fmt_opt(threshold_on), fmt_opt(threshold_off),
-                    fmt_opt(activity_threshold),
-                ])
+                metrics_writer.writerow(
+                    detector.csv_row(metrics, timestamp, stats.packets, rssi))
                 metrics_file.flush()
 
             print('\r%s  motion=%.4f  activity=%.2f  rssi=%4d  packets=%6d'
-                  % (level, smoothed,
-                     float('nan') if activity_score is None else activity_score,
+                  % (metrics['status'], metrics['smoothed'],
+                     float('nan') if metrics['activity'] is None
+                     else metrics['activity'],
                      rssi, stats.packets),
                   end='', flush=True)
 

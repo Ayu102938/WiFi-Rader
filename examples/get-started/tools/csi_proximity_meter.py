@@ -9,6 +9,9 @@
 # - 2026-11-19: Moved the CSI front end (line parsing, subcarrier selection,
 #   serial handling, read loop, CSV layout) to the shared csi_common module;
 #   only the absolute-energy trend stays here.
+# - 2026-11-19: Moved the energy/trend state machine to
+#   csi_detectors.ProximityMeter so the web UI can drive the same detector; this
+#   script now only parses arguments and prints results.
 #
 # This file is derived from examples/get-started/tools/csi_occupancy_meter.py and
 # csi_motion_detector.py.  It shares the CSI front end through csi_common and
@@ -82,61 +85,12 @@ import argparse
 import csv
 import sys
 import time
-from collections import deque
 
-import numpy as np
-
-from csi_common import (Ema, PacketStats, Progress, SerialOpenError,
-                        SubcarrierSelector, csv_header, fmt_opt,
+from csi_common import (PacketStats, Progress, SerialOpenError, csv_header,
                         iter_csi_packets, open_serial)
-
-METRICS_COLUMNS = [
-    'timestamp', 'packet_num', 'energy', 'smoothed_energy', 'trend',
-    'direction', 'rssi', 'energy_baseline_mu', 'energy_baseline_sigma',
-    'trend_threshold',
-]
-
-DIR_APPROACHING = '近づいている'
-DIR_AWAY = '遠ざかっている'
-DIR_STATIONARY = '静止'
-DIR_CALIBRATING = 'キャリブレーション中'
-DIR_COLLECTING = '収集中'
-
-ENERGY_METRICS = ('power', 'amplitude')
-
-# A trend estimate needs history covering this fraction of --trend-window.
-TREND_MIN_COVERAGE = 0.8
-
-# Fallback trend threshold when the calibration window produced no usable
-# trend samples (for example a very slow packet rate): 1% of the mean energy.
-TREND_FALLBACK_RELATIVE = 0.01
-
-# Calibration needs a few trend samples on top of the elapsed time.
-MIN_TREND_SAMPLES = 5
-MIN_ENERGY_SAMPLES = 20
-
-
-def compute_energy(amplitude, index, metric):
-    """Return the absolute per-packet energy over the selected subcarriers.
-
-    ``power`` is ``mean(I^2 + Q^2)`` and ``amplitude`` is
-    ``mean(sqrt(I^2 + Q^2))``.  The amplitude is *not* normalized by its own
-    mean: the absolute received level is what makes an approach/departure
-    visible at all.  Returns ``None`` when the result is not finite.
-    """
-    used = amplitude[index]
-    if used.size == 0:
-        return None
-
-    if metric == 'amplitude':
-        energy = float(np.mean(used))
-    else:
-        energy = float(np.mean(used * used))
-
-    if not np.isfinite(energy):
-        return None
-    return energy
-
+from csi_detectors import (DIR_APPROACHING, DIR_AWAY, DIR_CALIBRATING,
+                           DIR_STATIONARY, ENERGY_METRICS, MIN_TREND_SAMPLES,
+                           ProximityMeter)
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
@@ -178,128 +132,14 @@ def build_arg_parser():
     return parser
 
 
-class TrendTracker:
-    """Time-stamped smoothed-energy history for a lagged difference."""
-
-    def __init__(self, window_seconds, min_coverage=TREND_MIN_COVERAGE):
-        self.window = window_seconds
-        self.min_coverage = min_coverage
-        maxlen = max(512, int(window_seconds * 1000))
-        self.samples = deque(maxlen=maxlen)
-
-    def clear(self):
-        self.samples.clear()
-
-    def append(self, now, value):
-        self.samples.append((now, value))
-        # Keep a margin of 1.5 windows: enough to always contain the reference
-        # sample without letting the buffer grow for the whole run.
-        cutoff = now - 1.5 * self.window
-        while len(self.samples) > 2 and self.samples[0][0] < cutoff:
-            self.samples.popleft()
-
-    def coverage(self):
-        if len(self.samples) < 2:
-            return 0.0
-        span = self.samples[-1][0] - self.samples[0][0]
-        return span / self.window if self.window > 0 else 1.0
-
-    def ready(self):
-        return self.coverage() >= self.min_coverage
-
-    def trend(self):
-        """Current smoothed energy minus the sample closest to now - window.
-
-        Returns ``None`` until the history covers ``min_coverage`` of the
-        window, so the trend never mixes a very short lag into the threshold
-        calibration.
-        """
-        if not self.ready():
-            return None
-        now, current = self.samples[-1]
-        target = now - self.window
-        # The history is small (a couple of thousand entries at most), so a
-        # linear scan is cheaper than maintaining a second index.
-        best = min(self.samples, key=lambda item: abs(item[0] - target))
-        return current - best[1]
-
-
-class Calibration:
-    """Collects empty-room energy and trend samples and derives thresholds."""
-
-    def __init__(self, seconds, min_energy=MIN_ENERGY_SAMPLES,
-                 min_trend=MIN_TREND_SAMPLES, grace=2.0):
-        self.seconds = seconds
-        self.min_energy = min_energy
-        self.min_trend = min_trend
-        self.grace = grace
-        self.energies = []
-        self.trends = []
-        self.start = None
-
-    def start_now(self):
-        if self.start is None:
-            self.start = time.monotonic()
-
-    def add_energy(self, value):
-        self.start_now()
-        self.energies.append(value)
-
-    def add_trend(self, value):
-        self.start_now()
-        self.trends.append(value)
-
-    def elapsed(self):
-        return 0.0 if self.start is None else time.monotonic() - self.start
-
-    def progress(self):
-        """Return ``(elapsed, fraction)`` for the calibration progress line."""
-        elapsed = self.elapsed()
-        fraction = 0.0
-        if self.seconds > 0:
-            fraction = min(1.0, elapsed / self.seconds)
-        return elapsed, fraction
-
-    def done(self):
-        if self.start is None:
-            return False
-        elapsed = self.elapsed()
-        if elapsed < self.seconds:
-            return False
-        if len(self.energies) < self.min_energy:
-            return False
-        if len(self.trends) >= self.min_trend:
-            return True
-        # Slow serial links may not fill the trend buffer in time; stop anyway
-        # instead of calibrating forever and fall back to a relative threshold.
-        return elapsed >= self.seconds + self.grace
-
-    def energy_result(self):
-        """Return ``(mu, sigma)`` of the smoothed energy during calibration."""
-        arr = np.asarray(self.energies, dtype=np.float64)
-        if not arr.size:
-            return 0.0, 0.0
-        mu = float(arr.mean())
-        sigma = float(arr.std())
-        return mu, sigma
-
-    def trend_threshold(self, energy_mu):
-        """Return the auto trend threshold and whether it was a fallback."""
-        arr = np.asarray(self.trends, dtype=np.float64)
-        if arr.size:
-            sigma = float(arr.std())
-            threshold = max(3.0 * sigma, 1e-9)
-            if np.isfinite(threshold):
-                return threshold, False
-        return max(TREND_FALLBACK_RELATIVE * abs(energy_mu), 1e-9), True
-
-
-def classify(trend, threshold):
-    if trend > threshold:
-        return DIR_APPROACHING
-    if trend < -threshold:
-        return DIR_AWAY
-    return DIR_STATIONARY
+def show_calibration(progress, detector):
+    """Print the rate-limited calibration line (time, energy and trend samples)."""
+    elapsed, fraction, samples = detector.calibration_progress()
+    progress.show('キャリブレーション中... %4.1f/%4.1fs (%3d%%, %d energy, '
+                  '%d trend samples)'
+                  % (elapsed, detector.calibration.seconds,
+                     int(fraction * 100), samples,
+                     len(detector.calibration.trends)))
 
 
 def main(argv=None):
@@ -338,24 +178,16 @@ def main(argv=None):
     if args.metrics_csv:
         metrics_file = open(args.metrics_csv, 'w', newline='')
         metrics_writer = csv.writer(metrics_file)
-        metrics_writer.writerow(METRICS_COLUMNS)
+        metrics_writer.writerow(ProximityMeter.columns)
         metrics_file.flush()
 
-    selector = SubcarrierSelector(args.subcarriers, args.edge_skip)
+    detector = ProximityMeter(
+        calib=args.calib, trend_window=args.trend_window,
+        ema_alpha=args.ema_alpha, energy_metric=args.energy_metric,
+        threshold=args.threshold, subcarriers=args.subcarriers,
+        edge_skip=args.edge_skip)
     stats = PacketStats()
-
-    ema = Ema(args.ema_alpha)
-    tracker = TrendTracker(args.trend_window)
-    calibration = Calibration(
-        args.calib, grace=max(2.0 * args.trend_window, 2.0))
     progress = Progress(interval=0.1)
-
-    energy_mu = energy_sigma = float('nan')
-    trend_threshold = float('nan')
-    calibrated = False
-    direction = DIR_COLLECTING
-    last_energy = float('nan')
-    last_trend = None
 
     print('Listening on %s @ %d baud (energy-metric=%s, trend-window=%.1fs, '
           'ema-alpha=%.2f)'
@@ -369,19 +201,12 @@ def main(argv=None):
     try:
         for packet in iter_csi_packets(ser, stats):
             if packet is None:
-                if not calibrated:
-                    elapsed, fraction = calibration.progress()
-                    progress.show(
-                        'キャリブレーション中... %4.1f/%4.1fs (%3d%%, %d energy, '
-                        '%d trend samples)'
-                        % (elapsed, calibration.seconds, int(fraction * 100),
-                           len(calibration.energies),
-                           len(calibration.trends)))
+                if not detector.calibrated:
+                    show_calibration(progress, detector)
                 continue
 
             row, amplitude, rssi = packet
             timestamp = time.time()
-            now = time.monotonic()
 
             if csv_writer is not None:
                 if stats.packets == 1:
@@ -390,91 +215,51 @@ def main(argv=None):
                 csv_file.flush()
 
             try:
-                index = selector.indexes(amplitude.shape[0])
+                metrics = detector.update(amplitude, rssi)
             except argparse.ArgumentTypeError as exc:
                 print('\nerror: %s' % exc, file=sys.stderr)
                 return 2
-            # A changed subcarrier count means the radio re-tuned.  The energy
-            # scale changes with it, so restart the smoothing and the trend
-            # history instead of reporting a fake jump.
-            if selector.changed:
-                ema = Ema(args.ema_alpha)
-                tracker.clear()
-
-            energy = compute_energy(amplitude, index, args.energy_metric)
-            if energy is None:
+            if metrics is None:
                 stats.skipped += 1
                 continue
-
-            smoothed = ema.update(energy)
             stats.scored += 1
-            last_energy = energy
-            tracker.append(now, smoothed)
-            trend = tracker.trend()
-            last_trend = trend
 
-            if not calibrated:
-                calibration.add_energy(smoothed)
-                if trend is not None:
-                    calibration.add_trend(trend)
-
+            if metrics['status'] == DIR_CALIBRATING:
                 if metrics_writer is not None:
-                    fixed = fmt_opt(args.threshold) if args.threshold else ''
-                    metrics_writer.writerow([
-                        '%.3f' % timestamp, stats.packets,
-                        fmt_opt(energy), fmt_opt(smoothed), fmt_opt(trend),
-                        DIR_CALIBRATING, rssi, '', '', fixed,
-                    ])
+                    metrics_writer.writerow(
+                        detector.csv_row(metrics, timestamp, stats.packets, rssi))
                     metrics_file.flush()
-
-                elapsed, fraction = calibration.progress()
-                progress.show(
-                    'キャリブレーション中... %4.1f/%4.1fs (%3d%%, %d energy, '
-                    '%d trend samples)'
-                    % (elapsed, calibration.seconds, int(fraction * 100),
-                       len(calibration.energies), len(calibration.trends)))
-
-                if calibration.done():
-                    energy_mu, energy_sigma = calibration.energy_result()
-                    if args.threshold is None:
-                        trend_threshold, fallback = \
-                            calibration.trend_threshold(energy_mu)
-                        note = ' [fallback]' if fallback else ''
-                    else:
-                        trend_threshold = args.threshold
+                show_calibration(progress, detector)
+                if metrics['calibrated_now']:
+                    if args.threshold is not None:
                         note = ' [fixed]'
-                    calibrated = True
+                    elif detector.threshold_fallback:
+                        note = ' [fallback]'
+                    else:
+                        note = ''
                     print('\nキャリブレーション完了: energy mu=%.4f sigma=%.4f / '
                           'trend threshold=%.4f%s (%d energy, %d trend samples)'
-                          % (energy_mu, energy_sigma, trend_threshold, note,
-                             len(calibration.energies),
-                             len(calibration.trends)))
-                    if args.threshold is None and \
-                            len(calibration.trends) < MIN_TREND_SAMPLES:
+                          % (metrics['mu'], metrics['sigma'],
+                             metrics['threshold'], note,
+                             metrics['calib_samples'], metrics['trend_samples']))
+                    if (args.threshold is None
+                            and metrics['trend_samples'] < MIN_TREND_SAMPLES):
                         print('警告: trend のベースラインが十分に取れませんでした '
                               '(%d samples)。--calib を長くするか、'
                               '--threshold を指定してください。'
-                              % len(calibration.trends), file=sys.stderr)
+                              % metrics['trend_samples'], file=sys.stderr)
                 continue
 
-            if trend is None:
-                direction = DIR_COLLECTING
-            else:
-                direction = classify(trend, trend_threshold)
-
             if metrics_writer is not None:
-                metrics_writer.writerow([
-                    '%.3f' % timestamp, stats.packets,
-                    fmt_opt(energy), fmt_opt(smoothed), fmt_opt(trend),
-                    direction, rssi, fmt_opt(energy_mu),
-                    fmt_opt(energy_sigma), fmt_opt(trend_threshold),
-                ])
+                metrics_writer.writerow(
+                    detector.csv_row(metrics, timestamp, stats.packets, rssi))
                 metrics_file.flush()
 
             progress.show(
                 '%s  energy=%.2f  trend=%s  rssi=%d  packets=%d'
-                % (direction, smoothed,
-                   '-' if trend is None else '%+.2f' % trend,
+                % (metrics['status'], metrics['smoothed'],
+                   '-' if metrics['trend'] is None
+                   else '%+.2f' % metrics['trend'],
                    rssi, stats.packets))
 
     except KeyboardInterrupt:
