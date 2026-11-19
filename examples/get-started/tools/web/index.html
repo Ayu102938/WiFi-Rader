@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WiFi-Rader ダッシュボード</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <h1>WiFi-Rader <span>ダッシュボード</span></h1>
+    <p class="sub">ESP32 Wi-Fi CSI sensing · presence, occupancy and proximity</p>
+  </div>
+  <div class="source">
+    <span id="source-badge" class="badge">接続待ち</span>
+    <span id="source-detail" class="muted">—</span>
+    <span id="uptime" class="muted">0 s</span>
+  </div>
+</header>
+
+<main>
+  <section class="panel controls">
+    <div class="tabs" id="tool-tabs" role="tablist">
+      <button class="tab" data-tool="motion" role="tab">在否検出<span>motion</span></button>
+      <button class="tab" data-tool="occupancy" role="tab">混雑度<span>occupancy</span></button>
+      <button class="tab" data-tool="proximity" role="tab">近接方向<span>proximity</span></button>
+    </div>
+
+    <div class="fields">
+      <label>キャリブレーション
+        <input id="cfg-calib" type="number" step="1" min="1" max="120">
+        <span class="unit">秒</span>
+      </label>
+      <label>ウィンドウ
+        <input id="cfg-window" type="number" step="10" min="20" max="1000">
+        <span class="unit">packets</span>
+      </label>
+      <label>EMA α
+        <input id="cfg-ema" type="number" step="0.05" min="0.02" max="1">
+      </label>
+      <label id="field-activity" hidden>活動指標
+        <select id="cfg-activity-metric">
+          <option value="cv">cv</option>
+          <option value="diff">diff</option>
+          <option value="peaks">peaks</option>
+        </select>
+      </label>
+      <label id="field-energy" hidden>エネルギー
+        <select id="cfg-energy-metric">
+          <option value="power">power</option>
+          <option value="amplitude">amplitude</option>
+        </select>
+      </label>
+      <button id="apply" class="apply">適用して再キャリブレーション</button>
+    </div>
+    <p id="message" class="message" hidden></p>
+  </section>
+
+  <section class="panel status">
+    <div class="status-badge" id="status-badge">待機中</div>
+    <div class="status-hint" id="status-hint">CSI パケットを待っています。</div>
+    <dl class="readouts" id="readouts"></dl>
+  </section>
+
+  <section class="panel chart-panel">
+    <div class="panel-head">
+      <h2>スコア推移 <span class="muted" id="chart-metric">score / smoothed</span></h2>
+      <span class="muted" id="chart-range">直近 60 秒</span>
+    </div>
+    <canvas id="chart" height="260"></canvas>
+  </section>
+
+  <section class="panel wave-panel">
+    <div class="panel-head">
+      <h2>サブキャリア振幅 <span class="muted" id="wave-metric">normalized amplitude</span></h2>
+      <span class="muted" id="wave-count">—</span>
+    </div>
+    <canvas id="wave" height="180"></canvas>
+  </section>
+
+  <section class="panel log-panel">
+    <div class="panel-head">
+      <h2>状態の変化 <span class="muted">transitions</span></h2>
+      <span class="muted" id="event-count">0</span>
+    </div>
+    <ul id="events" class="events"><li class="muted">まだ変化はありません。</li></ul>
+  </section>
+</main>
+
+<footer class="counters">
+  <span>packets <b id="c-packets">0</b></span>
+  <span>scored <b id="c-scored">0</b></span>
+  <span>skipped <b id="c-skipped">0</b></span>
+  <span>log lines <b id="c-other">0</b></span>
+  <span id="link-state" class="muted">切断</span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
