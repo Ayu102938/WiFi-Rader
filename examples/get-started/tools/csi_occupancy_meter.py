@@ -6,11 +6,14 @@
 #
 # Modified by Ayu102938
 # - 2026-10-24: Created csi_occupancy_meter.py for 3-level occupancy classification.
+# - 2026-11-19: Moved the CSI front end (line parsing, subcarrier selection,
+#   amplitude normalization, serial handling, read loop) to the shared
+#   csi_common module; only the motion/activity statistics stay here.
 #
 # This file is derived from examples/get-started/tools/csi_motion_detector.py.
-# The CSI parser, subcarrier selection, amplitude normalization and the motion
-# score are copied verbatim so the two tools stay comparable, while this script
-# adds a second "activity" statistic and a three-level occupancy state machine.
+# The motion score is computed exactly as in that tool so the two stay
+# comparable, while this script adds a second "activity" statistic and a
+# three-level occupancy state machine.
 #
 """Three-level occupancy classification from ESP-CSI serial output.
 
@@ -81,33 +84,20 @@ Usage::
     python csi_occupancy_meter.py -p /dev/ttyACM0 \
         --csv csi_capture.csv --metrics-csv occupancy.csv
 
-Requires only ``pyserial`` and ``numpy`` (both in requirements.txt).
+Requires only ``pyserial`` and ``numpy`` (see requirements.txt).
 """
 
 import argparse
 import csv
-import json
 import sys
 import time
 from collections import deque
-from io import StringIO
 
 import numpy as np
-import serial
 
-# Column layouts emitted by the ESP-CSI receiver firmwares.
-DATA_COLUMNS_NAMES_C5C6 = [
-    'type', 'id', 'mac', 'rssi', 'rate', 'noise_floor', 'fft_gain',
-    'agc_gain', 'channel', 'local_timestamp', 'sig_len', 'rx_state',
-    'len', 'first_word', 'data',
-]
-DATA_COLUMNS_NAMES = [
-    'type', 'id', 'mac', 'rssi', 'rate', 'sig_mode', 'mcs', 'bandwidth',
-    'smoothing', 'not_sounding', 'aggregation', 'stbc', 'fec_coding',
-    'sgi', 'noise_floor', 'ampdu_cnt', 'channel', 'secondary_channel',
-    'local_timestamp', 'ant', 'sig_len', 'rx_state', 'len', 'first_word',
-    'data',
-]
+from csi_common import (Ema, PacketStats, Progress, SerialOpenError,
+                        SubcarrierSelector, csv_header, fmt_opt,
+                        iter_csi_packets, normalize_amplitude, open_serial)
 
 METRICS_COLUMNS = [
     'timestamp', 'packet_num', 'motion_score', 'smoothed_motion',
@@ -142,107 +132,6 @@ ACTIVITY_THRESHOLD_FLOORS = {
 # run time (this biases ``peaks`` and ``diff`` low, sometimes to zero).
 MIN_ACTIVITY_SAMPLES = 5
 BASELINE_ACTIVITY_WINDOW_FRACTION = 0.8
-
-
-def parse_csi_line(line):
-    """Parse one serial line into ``(row, amplitude, rssi)``.
-
-    Returns ``None`` for anything that is not a complete, well-formed
-    ``CSI_DATA`` record.  Malformed input is expected on a live serial
-    link (boot messages, truncated reads), so callers simply skip it.
-    """
-    if 'CSI_DATA' not in line:
-        return None
-
-    try:
-        row = next(csv.reader(StringIO(line)))
-    except (csv.Error, StopIteration):
-        return None
-
-    if len(row) not in (len(DATA_COLUMNS_NAMES), len(DATA_COLUMNS_NAMES_C5C6)):
-        return None
-
-    try:
-        csi_len = int(row[-3])
-        raw = json.loads(row[-1])
-    except (ValueError, IndexError, json.JSONDecodeError):
-        return None
-
-    if not isinstance(raw, list) or csi_len != len(raw):
-        return None
-
-    # The firmware interleaves imaginary then real parts: [Q, I, Q, I, ...]
-    n_pairs = len(raw) // 2
-    if n_pairs == 0:
-        return None
-    samples = np.asarray(raw[:n_pairs * 2], dtype=np.float64).reshape(n_pairs, 2)
-    amplitude = np.hypot(samples[:, 0], samples[:, 1])
-
-    try:
-        rssi = int(row[3])
-    except (ValueError, IndexError):
-        rssi = 0
-
-    return row, amplitude, rssi
-
-
-def parse_subcarrier_spec(spec, count):
-    """Turn ``"0-12,20,30-40"`` into an index array clipped to ``count``."""
-    if not spec:
-        return np.arange(count)
-
-    indexes = set()
-    for part in spec.split(','):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            if '-' in part:
-                start, end = part.split('-', 1)
-                indexes.update(range(int(start), int(end) + 1))
-            else:
-                indexes.add(int(part))
-        except ValueError:
-            raise argparse.ArgumentTypeError(
-                'invalid subcarrier specification: %r' % spec)
-
-    valid = sorted(i for i in indexes if 0 <= i < count)
-    if not valid:
-        return np.arange(count)
-    return np.asarray(valid, dtype=np.int64)
-
-
-def select_subcarriers(count, spec, edge_skip):
-    """Choose the subcarrier indexes used for the score.
-
-    An explicit ``--subcarriers`` specification wins.  Otherwise the first and
-    last ``edge_skip`` subcarriers are dropped, because guard, DC and null
-    subcarriers carry little useful signal and mostly add noise.
-    """
-    if spec:
-        return parse_subcarrier_spec(spec, count)
-
-    skip = max(0, min(edge_skip, (count - 1) // 2))
-    if skip == 0 or count - 2 * skip < 1:
-        return np.arange(count)
-    return np.arange(skip, count - skip)
-
-
-def normalize_amplitude(amplitude, index):
-    """Divide the used subcarriers by their mean amplitude.
-
-    This makes the metric independent of the link gain, so a gain or RSSI
-    change alone cannot be mistaken for motion.  Returns ``None`` when the
-    used subcarriers have zero (or non-finite) average magnitude.
-    """
-    used = amplitude[index]
-    mean = float(np.mean(used))
-    if not np.isfinite(mean) or mean <= 0.0:
-        return None
-    normalized = used / mean
-    if not np.all(np.isfinite(normalized)):
-        return None
-    return normalized
 
 
 def compute_activity(samples, metric, window_seconds):
@@ -399,43 +288,6 @@ class Calibration:
         return mu, sigma, threshold
 
 
-class Ema:
-    """Exponential moving average with warm-up on the first sample."""
-
-    def __init__(self, alpha):
-        self.alpha = alpha
-        self.value = None
-
-    def update(self, sample):
-        if self.value is None:
-            self.value = sample
-        else:
-            self.value = self.alpha * sample + (1.0 - self.alpha) * self.value
-        return self.value
-
-
-class Progress:
-    """Rate-limited ``\\r`` progress line so a piped log does not explode."""
-
-    def __init__(self, interval=0.2):
-        self.interval = interval
-        self.last = 0.0
-
-    def show(self, text):
-        now = time.monotonic()
-        if now - self.last < self.interval:
-            return
-        self.last = now
-        print('\r' + text.ljust(88), end='', flush=True)
-
-
-def fmt_opt(value):
-    """Format a float for CSV, or an empty field when it is undefined."""
-    if value is None or not np.isfinite(value):
-        return ''
-    return '%.6f' % value
-
-
 def activity_window_ready(samples, window_seconds):
     """True once the activity buffer covers most of the activity window."""
     if len(samples) < MIN_ACTIVITY_SAMPLES:
@@ -474,10 +326,9 @@ def main(argv=None):
         return 2
 
     try:
-        ser = serial.Serial(port=args.port, baudrate=args.baud, bytesize=8,
-                            parity='N', stopbits=1, timeout=1)
-    except serial.SerialException as exc:
-        print('error: cannot open %s: %s' % (args.port, exc), file=sys.stderr)
+        ser = open_serial(args.port, args.baud)
+    except SerialOpenError as exc:
+        print('error: %s' % exc, file=sys.stderr)
         return 1
 
     csv_file = None
@@ -497,12 +348,8 @@ def main(argv=None):
     window = deque(maxlen=args.window)
     # Timestamped motion scores; bounded so a long run cannot grow the buffer.
     activity = deque(maxlen=max(64, int(args.activity_window * 1000)))
-    window_len = None
-    index_cache = {}
-    packets = 0
-    scored = 0
-    skipped = 0
-    other_lines = 0
+    selector = SubcarrierSelector(args.subcarriers, args.edge_skip)
+    stats = PacketStats()
 
     ema = Ema(args.ema_alpha)
     calibration = Calibration(args.calib, args.calib_min_packets)
@@ -529,9 +376,8 @@ def main(argv=None):
           % (LEVEL_EMPTY, LEVEL_SINGLE, LEVEL_MULTI))
 
     try:
-        while True:
-            line = ser.readline()
-            if not line:
+        for packet in iter_csi_packets(ser, stats):
+            if packet is None:
                 if not calibrated:
                     elapsed, fraction = calibration.progress()
                     progress.show(
@@ -539,52 +385,30 @@ def main(argv=None):
                         % (elapsed, calibration.seconds, int(fraction * 100),
                            len(calibration.scores)))
                 continue
-            # A read interrupted by the timeout may return a partial line.
-            if not line.endswith(b'\n'):
-                skipped += 1
-                continue
 
-            text = line.decode('utf-8', errors='ignore').strip('\r\n')
-            parsed = parse_csi_line(text)
-            if parsed is None:
-                # Firmware logs and boot banners are not CSI records.
-                if 'CSI_DATA' in text:
-                    skipped += 1
-                else:
-                    other_lines += 1
-                continue
-
-            row, amplitude, rssi = parsed
-            packets += 1
+            row, amplitude, rssi = packet
             timestamp = time.time()
             now = time.monotonic()
 
             if csv_writer is not None:
-                if packets == 1:
-                    csv_writer.writerow(
-                        DATA_COLUMNS_NAMES if len(row) == len(DATA_COLUMNS_NAMES)
-                        else DATA_COLUMNS_NAMES_C5C6)
+                if stats.packets == 1:
+                    csv_writer.writerow(csv_header(row))
                 csv_writer.writerow(row)
                 csv_file.flush()
 
+            try:
+                index = selector.indexes(amplitude.shape[0])
+            except argparse.ArgumentTypeError as exc:
+                print('\nerror: %s' % exc, file=sys.stderr)
+                return 2
             # A changed subcarrier count means the radio re-tuned; restart.
-            if window_len is not None and amplitude.shape[0] != window_len:
+            if selector.changed:
                 window.clear()
                 activity.clear()
-            window_len = amplitude.shape[0]
-
-            if window_len not in index_cache:
-                try:
-                    index_cache[window_len] = select_subcarriers(
-                        window_len, args.subcarriers, args.edge_skip)
-                except argparse.ArgumentTypeError as exc:
-                    print('\nerror: %s' % exc, file=sys.stderr)
-                    return 2
-            index = index_cache[window_len]
 
             normalized = normalize_amplitude(amplitude, index)
             if normalized is None:
-                skipped += 1
+                stats.skipped += 1
                 continue
             window.append(normalized)
 
@@ -596,7 +420,7 @@ def main(argv=None):
                 # averaged over the selected subcarriers.
                 motion_score = float(variance.mean())
                 ema.update(motion_score)
-                scored += 1
+                stats.scored += 1
 
             # The activity statistic is only meaningful on steady-state
             # windows; a partially filled window has inflated variance.
@@ -629,7 +453,7 @@ def main(argv=None):
 
                 if metrics_writer is not None:
                     metrics_writer.writerow([
-                        '%.3f' % timestamp, packets,
+                        '%.3f' % timestamp, stats.packets,
                         fmt_opt(motion_score), fmt_opt(smoothed),
                         fmt_opt(activity_score), args.activity_metric,
                         LEVEL_CALIBRATING, rssi,
@@ -711,7 +535,7 @@ def main(argv=None):
 
             if metrics_writer is not None:
                 metrics_writer.writerow([
-                    '%.3f' % timestamp, packets,
+                    '%.3f' % timestamp, stats.packets,
                     fmt_opt(motion_score), fmt_opt(smoothed),
                     fmt_opt(activity_score), args.activity_metric, level, rssi,
                     fmt_opt(mu), fmt_opt(sigma),
@@ -723,13 +547,11 @@ def main(argv=None):
             print('\r%s  motion=%.4f  activity=%.2f  rssi=%4d  packets=%6d'
                   % (level, smoothed,
                      float('nan') if activity_score is None else activity_score,
-                     rssi, packets),
+                     rssi, stats.packets),
                   end='', flush=True)
 
     except KeyboardInterrupt:
-        print('\nstopped: %d packets parsed (%d scored), %d lines skipped, '
-              '%d log lines ignored'
-              % (packets, scored, skipped, other_lines))
+        print('\nstopped: %s' % stats.summary())
     finally:
         ser.close()
         if csv_file is not None:
