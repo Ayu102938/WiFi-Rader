@@ -466,7 +466,10 @@ required). It needs only `numpy` and `pyserial`.
 | `--replay FILE` | replay a `--csv` capture instead of reading the board |
 | `--synthetic` | generate a synthetic stream (development aid, no hardware) |
 
-The dashboard shows the three detectors as tabs, one status badge
+The dashboard follows the OS light/dark preference (with a header toggle that
+overrides it), selects the detector through a radio group, announces status
+changes to screen readers and keeps its charts described in text. It shows the
+three detectors as a mode switch, one status badge
 (`有人` / `無人`, `1人（小動き）` / `複数人（ざわざわ）`, `近づいている` /
 `遠ざかっている` / `静止`), the score chart with its thresholds, the per-subcarrier
 amplitude of the latest packet, and a log of state transitions. Calibration
@@ -500,7 +503,9 @@ uv run python csi_web_server.py -p /dev/ttyACM0
 | `--replay FILE` | 基板の代わりに `--csv` のキャプチャを再生 |
 | `--synthetic` | 合成ストリームを生成（開発用・実機不要） |
 
-画面では 3 つの検出器をタブで切り替えられます。状態バッジ（`有人` / `無人`、
+画面は OS のライト／ダーク設定に追従し（ヘッダーのボタンで上書き可）、検出器は
+ラジオボタンで切り替えます。状態の変化はスクリーンリーダーに通知され、グラフには
+テキストの説明が付きます。状態バッジ（`有人` / `無人`、
 `1人（小動き）` / `複数人（ざわざわ）`、`近づいている` / `遠ざかっている` /
 `静止`）、スコアと閾値のグラフ、直近パケットのサブキャリア振幅、状態遷移の
 ログを表示します。キャリブレーション秒数・窓幅・EMA・各ツール固有の指標は
