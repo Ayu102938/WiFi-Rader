@@ -17,7 +17,8 @@ Fork したものです。この Fork での追加・変更は[改変内容](#�
 |------|------|
 | `examples/get-started/csi_send` | TX ファームウェア（パケットを送り続ける） |
 | `examples/get-started/csi_recv` | RX ファームウェア（1 パケットごとに `CSI_DATA` 行を出力） |
-| `csi_recv_router`, `esp-radar/*`, `esp-crab/*` | 上流のサンプル（そのまま収録） |
+| `examples/get-started/csi_recv_router` | ルーターを受信元にする上流の派生版 |
+| `examples/esp-radar/*`, `examples/esp-crab/*` | 上流のサンプル（そのまま収録） |
 
 `examples/get-started/tools/` の Python 側:
 

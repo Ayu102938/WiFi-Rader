@@ -18,7 +18,8 @@ This repository is a fork of [espressif/esp-csi](https://github.com/espressif/es
 |-------|------|
 | `examples/get-started/csi_send` | TX firmware: sends packets continuously |
 | `examples/get-started/csi_recv` | RX firmware: prints one `CSI_DATA` line per packet |
-| `csi_recv_router`, `esp-radar/*`, `esp-crab/*` | Upstream examples, kept as shipped |
+| `examples/get-started/csi_recv_router` | Upstream variant that receives from a router instead of a TX board |
+| `examples/esp-radar/*`, `examples/esp-crab/*` | Upstream examples, kept as shipped |
 
 `examples/get-started/tools/` holds the Python side:
 
