@@ -698,7 +698,6 @@ class OccupancyMeter(BaseDetector):
             (self.activity_mu, self.activity_sigma,
              auto_activity) = self.calibration.activity_result(
                  self.activity_metric)
-            self.activity_threshold_overridden = self.activity_threshold is not None
             if self.activity_threshold is None:
                 self.activity_threshold = auto_activity
             self.calibrated = True
@@ -747,8 +746,7 @@ class OccupancyMeter(BaseDetector):
                 fmt_opt(metrics['score']), fmt_opt(metrics['smoothed']),
                 fmt_opt(metrics['activity']), self.activity_metric]
         if metrics['status'] == LEVEL_CALIBRATING:
-            return head + [LEVEL_CALIBRATING, rssi, '', '', '', '',
-                           fmt_opt(metrics['activity_threshold'])]
+            return head + [LEVEL_CALIBRATING, rssi, '', '', '', '', '']
         return head + [metrics['status'], rssi, fmt_opt(metrics['mu']),
                        fmt_opt(metrics['sigma']),
                        fmt_opt(metrics['threshold_on']),

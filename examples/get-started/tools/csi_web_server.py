@@ -122,13 +122,16 @@ class SyntheticSource:
     """Generates a CSI-like stream so the dashboard runs without hardware.
 
     The generated link is empty for ``idle_seconds``, then disturbed for
-    ``busy_seconds`` with a small ramp, which is enough to exercise the whole
-    pipeline (calibration, thresholds, status transitions) during development.
+    ``busy_seconds`` with a small ramp.  The idle phase is deliberately longer
+    than the dashboard's default calibration time, so a freshly started
+    dashboard learns an empty-room baseline and then actually sees the busy
+    phase: a shorter idle phase would fold motion into the baseline and leave
+    the thresholds above anything the demo produces.
     """
 
     kind = 'synthetic'
 
-    def __init__(self, rate=100.0, idle_seconds=8.0, busy_seconds=6.0):
+    def __init__(self, rate=100.0, idle_seconds=20.0, busy_seconds=8.0):
         self.rate = rate
         self.idle_seconds = idle_seconds
         self.busy_seconds = busy_seconds
@@ -284,7 +287,6 @@ class Session:
         self.detector = make_detector(self.config)
         self.stats = csi_common.PacketStats()
         self.started = time.time()
-        self.started_monotonic = time.monotonic()
         self.latest = {}
         self.wave = []
         self.history = deque(maxlen=HISTORY_POINTS)
@@ -307,22 +309,34 @@ class Session:
                 if packet is None:
                     continue
                 row, amplitude, rssi = packet
+                detector = self.detector
                 try:
-                    metrics = self.detector.update(amplitude, rssi)
+                    metrics = detector.update(amplitude, rssi)
                 except argparse.ArgumentTypeError as exc:
-                    self.error = str(exc)
+                    self._fail(str(exc))
                     return
                 if metrics is None:
                     continue
                 if metrics.get('score') is not None:
                     self.stats.scored += 1
-                self._publish(metrics, rssi)
+                self._publish(metrics, rssi, detector)
         except (OSError, RuntimeError) as exc:  # serial disappeared, port closed
-            self.error = str(exc)
+            self._fail(str(exc))
         finally:
             self.source.close()
 
-    def _publish(self, metrics, rssi):
+    def _fail(self, message):
+        """Record a fatal read error and wake the SSE loops.
+
+        The stream only pushes a tick when something changed, so a reader that
+        dies silently would leave every dashboard claiming to be connected
+        while its numbers freeze.
+        """
+        with self.lock:
+            self.error = message
+            self.frames += 1
+
+    def _publish(self, metrics, rssi, detector):
         wave = self.detector.last_normalized
         if wave is not None and len(wave) > 0:
             step = max(1, int(len(wave) // WAVE_POINTS))
@@ -332,6 +346,10 @@ class Session:
 
         now = time.time()
         with self.lock:
+            if detector is not self.detector:
+                # The dashboard switched detector while this packet was in
+                # flight; its readings belong to the previous one.
+                return
             self.latest = dict(metrics)
             self.latest['rssi'] = rssi
             self.latest['timestamp'] = now
@@ -360,9 +378,18 @@ class Session:
             return
         self.last_status = status
         if self.events and now - self.last_event_time < EVENT_MIN_INTERVAL:
-            # Same burst of noise as the previous entry; keep the log short.
-            self.events[0]['t'] = round(now - self.started, 2)
-            self.events[0]['status'] = status
+            # Same burst of noise as the previous entry: replace it instead of
+            # appending, but keep a fresh id so connected dashboards notice the
+            # update.  A new dict, because snapshot() hands these out.
+            self.event_id += 1
+            self.events[0] = {
+                'id': self.event_id,
+                't': round(now - self.started, 2),
+                'status': status,
+                'score': _number(metrics.get('score')),
+                'activity': _number(metrics.get('activity')),
+                'trend': _number(metrics.get('trend')),
+            }
             return
         self.last_event_time = now
         self.event_id += 1
@@ -379,10 +406,10 @@ class Session:
 
     def reconfigure(self, updates):
         """Apply ``updates``, rebuilding the detector.  Returns ``(config, error)``."""
-        config, error = validate_config(self.config, updates)
-        if error:
-            return None, error
         with self.lock:
+            config, error = validate_config(self.config, updates)
+            if error:
+                return None, error
             self.config = config
             self.detector = make_detector(config)
             self.stats.reset()
@@ -393,7 +420,6 @@ class Session:
             self.last_status = None
             self.last_event_time = 0.0
             self.started = time.time()
-            self.started_monotonic = time.monotonic()
             self.frames = 0
             self.error = None
         return config, None
@@ -522,6 +548,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not isinstance(updates, dict):
             self._send_json({'error': 'expected a JSON object'}, status=400)
             return
+        origin = self.headers.get('Origin')
+        if origin and origin != 'http://' + (self.headers.get('Host') or ''):
+            # Another page in the same browser can post here without a
+            # preflight; the dashboard itself never sends an Origin header.
+            self._send_json({'error': 'cross-origin request refused'},
+                            status=403)
+            return
         config, error = self.server.session.reconfigure(updates)
         if error:
             self._send_json({'error': error}, status=400)
@@ -536,17 +569,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
         self.end_headers()
         self.wfile.write(body)
 
     def _serve_static(self, path):
         if path in ('/', ''):
             path = '/index.html'
-        relative = path.lstrip('/')
-        if '..' in relative.split('/') or relative.startswith('/'):
+        # Normalise separators first: os.path.join also treats "\\" as a
+        # separator on Windows, where a bare ".." component check would not
+        # catch "\\..\\..\\file".
+        relative = path.lstrip('/').replace('\\', '/')
+        if '..' in relative.split('/'):
             self._send_json({'error': 'not found'}, status=404)
             return
-        full = os.path.join(WEB_ROOT, relative)
+        root = os.path.realpath(WEB_ROOT)
+        full = os.path.realpath(os.path.join(root, relative))
+        if full != root and not full.startswith(root + os.sep):
+            self._send_json({'error': 'not found'}, status=404)
+            return
         if not os.path.isfile(full):
             self._send_json({'error': 'not found'}, status=404)
             return
@@ -560,6 +601,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
         self.end_headers()
         self.wfile.write(body)
 
@@ -654,6 +696,10 @@ def main(argv=None):
 
     print('WiFi-Rader dashboard: http://%s:%d/  (%s)'
           % (args.host, args.http_port, source.description))
+    if args.host not in ('127.0.0.1', 'localhost', '::1'):
+        print('warning: --host %s exposes the dashboard and its config '
+              'endpoint to every host that can reach this machine' % args.host,
+              file=sys.stderr)
     print('Detector: %s. Press Ctrl+C to stop.' % args.tool)
     try:
         server.serve_forever(poll_interval=0.2)
@@ -664,6 +710,9 @@ def main(argv=None):
         # from this thread; closing the socket is all that is left to do.
         session.stopped.set()
         server.server_close()
+        # The reader exits within the serial timeout; closing the source first
+        # would make it raise on the way out.
+        reader.join(timeout=2.0)
         session.source.close()
     if session.error:
         print('warning: %s' % session.error, file=sys.stderr)
