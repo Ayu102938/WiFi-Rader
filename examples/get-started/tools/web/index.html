@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Both schemes are supported; the inline script below only replays a stored
+     override before first paint so the page cannot flash the wrong scheme. -->
+<meta name="color-scheme" content="light dark">
+<script>
+  try {
+    var stored = localStorage.getItem('color-scheme');
+    if (stored === 'light' || stored === 'dark') {
+      document.querySelector('meta[name="color-scheme"]').content = stored;
+    }
+  } catch (error) {
+    /* Storage blocked: follow the system preference. */
+  }
+</script>
+<title>WiFi-Rader CSI ダッシュボード</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip-link" href="#dashboard">本文へスキップ</a>
+
+<header class="app-header">
+  <div class="brand">
+    <p class="eyebrow">WiFi-Rader</p>
+    <h1>CSI ダッシュボード</h1>
+    <p class="lede">ESP32 の Wi-Fi CSI から、在否・混雑度・近接方向をリアルタイムに表示します。</p>
+  </div>
+  <div class="header-tools">
+    <p class="source">
+      <span class="badge" id="source-badge">接続待ち</span>
+      <span class="muted" id="source-detail">—</span>
+    </p>
+    <button type="button" class="theme-toggle" id="theme-toggle">
+      <span class="theme-option to-dark">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+        <span class="visually-hidden">ダークテーマに切り替え</span>
+      </span>
+      <span class="theme-option to-light">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg>
+        <span class="visually-hidden">ライトテーマに切り替え</span>
+      </span>
+    </button>
+  </div>
+</header>
+
+<main class="dashboard" id="dashboard">
+  <!-- Detector choice is a mode switch over one set of readings, so it is a
+       radio group rather than a tablist: there are no separate panels to show. -->
+  <section class="panel controls" aria-labelledby="controls-heading">
+    <h2 class="panel-title" id="controls-heading">検出器</h2>
+    <fieldset class="detector-switch">
+      <legend class="visually-hidden">表示する検出器</legend>
+      <label class="option">
+        <input type="radio" name="detector" value="motion" checked>
+        <span class="option-text">在否検出<small>motion</small></span>
+      </label>
+      <label class="option">
+        <input type="radio" name="detector" value="occupancy">
+        <span class="option-text">混雑度<small>occupancy</small></span>
+      </label>
+      <label class="option">
+        <input type="radio" name="detector" value="proximity">
+        <span class="option-text">近接方向<small>proximity</small></span>
+      </label>
+    </fieldset>
+
+    <form class="params" id="params">
+      <p class="field">
+        <label for="cfg-calib">キャリブレーション</label>
+        <span class="input-row">
+          <input type="number" id="cfg-calib" name="calib" min="1" max="120" step="1" required>
+          <span class="unit">秒</span>
+        </span>
+      </p>
+      <p class="field">
+        <label for="cfg-window">ウィンドウ</label>
+        <span class="input-row">
+          <input type="number" id="cfg-window" name="window" min="20" max="1000" step="10" required>
+          <span class="unit">packets</span>
+        </span>
+      </p>
+      <p class="field">
+        <label for="cfg-ema">EMA α</label>
+        <span class="input-row">
+          <input type="number" id="cfg-ema" name="ema_alpha" min="0.02" max="1" step="0.05" required>
+        </span>
+      </p>
+      <p class="field" id="field-activity" hidden>
+        <label for="cfg-activity-metric">活動指標</label>
+        <select id="cfg-activity-metric" name="activity_metric">
+          <option value="cv">cv（変動係数）</option>
+          <option value="diff">diff（差分の標準偏差）</option>
+          <option value="peaks">peaks（毎秒の極大値）</option>
+        </select>
+      </p>
+      <p class="field" id="field-energy" hidden>
+        <label for="cfg-energy-metric">エネルギー</label>
+        <select id="cfg-energy-metric" name="energy_metric">
+          <option value="power">power（I²+Q²）</option>
+          <option value="amplitude">amplitude（振幅）</option>
+        </select>
+      </p>
+      <button type="submit" class="primary">適用して再キャリブレーション</button>
+      <p class="form-message" id="form-message" role="status" hidden></p>
+    </form>
+  </section>
+
+  <section class="panel status-panel" aria-labelledby="status-heading">
+    <h2 class="panel-title" id="status-heading">現在の状態</h2>
+    <p class="status">
+      <span class="status-mark" id="status-mark" aria-hidden="true"></span>
+      <span class="status-label" id="status-label">待機中</span>
+    </p>
+    <p class="status-hint" id="status-hint">CSI パケットを待っています。</p>
+    <dl class="readouts" id="readouts"></dl>
+  </section>
+
+  <figure class="panel chart-panel">
+    <figcaption class="panel-head">
+      <h2 class="panel-title" id="chart-title">スコア推移</h2>
+      <span class="muted" id="chart-metric">score / smoothed</span>
+      <span class="muted" id="chart-range">直近 60 秒</span>
+    </figcaption>
+    <canvas id="chart" height="300" role="img" aria-label="スコア推移"
+            aria-describedby="chart-description"></canvas>
+    <p class="visually-hidden" id="chart-description"></p>
+  </figure>
+
+  <figure class="panel wave-panel">
+    <figcaption class="panel-head">
+      <h2 class="panel-title" id="wave-title">サブキャリア振幅</h2>
+      <span class="muted" id="wave-metric">normalized amplitude</span>
+      <span class="muted" id="wave-count">—</span>
+    </figcaption>
+    <canvas id="wave" height="170" role="img" aria-label="サブキャリア振幅"
+            aria-describedby="wave-description"></canvas>
+    <p class="visually-hidden" id="wave-description"></p>
+  </figure>
+
+  <section class="panel events-panel" aria-labelledby="events-heading">
+    <div class="panel-head">
+      <h2 class="panel-title" id="events-heading">状態の変化</h2>
+      <span class="muted" id="event-count">0</span>
+    </div>
+    <ol class="events" id="events">
+      <li class="muted">まだ変化はありません。</li>
+    </ol>
+  </section>
+</main>
+
+<footer class="counters">
+  <p><span class="muted">packets</span> <b id="c-packets">0</b></p>
+  <p><span class="muted">scored</span> <b id="c-scored">0</b></p>
+  <p><span class="muted">skipped</span> <b id="c-skipped">0</b></p>
+  <p><span class="muted">log lines</span> <b id="c-other">0</b></p>
+  <p><span class="muted">uptime</span> <b id="c-uptime">0 s</b></p>
+  <p class="link-state" id="link-state">切断</p>
+</footer>
+
+<!-- Status transitions are announced from here; the visual status above is
+     updated far too often to be a live region itself. -->
+<p class="visually-hidden" id="announcer" role="status"></p>
+
+<!-- Chart colours are resolved from CSS here so canvas drawing follows the
+     active colour scheme, including light-dark() tokens. -->
+<div class="palette" id="palette" hidden>
+  <span data-token="accent"></span>
+  <span data-token="text"></span>
+  <span data-token="muted"></span>
+  <span data-token="ok"></span>
+  <span data-token="warn"></span>
+  <span data-token="danger"></span>
+  <span data-token="surface"></span>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

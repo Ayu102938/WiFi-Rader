@@ -22,6 +22,14 @@
 >   coarse approach/departure detector based on absolute CSI energy trends.
 > - 2026-10-24: Rewrote this `README.md` as a setup guide for the WiFi-Rader
 >   project.
+> - 2026-11-19: Moved the duplicated CSI front end of the three tools into
+>   `examples/get-started/tools/csi_common.py`, and their per-packet state
+>   machines into `csi_detectors.py`.
+> - 2026-11-19: Created `examples/get-started/tools/csi_web_server.py` and
+>   `examples/get-started/tools/web/`, a local web dashboard that drives the
+>   same detectors from a browser.
+> - 2026-11-19: Added the GUI viewer's missing `scipy` / `statsmodels` /
+>   `matplotlib` dependencies to `requirements.txt`.
 >
 > 本リポジトリは [espressif/esp-csi](https://github.com/espressif/esp-csi) を
 > **Apache License, Version 2.0** で Fork したものです。
@@ -430,6 +438,82 @@ low-frequency trends over seconds, not instant-by-instant changes.
 これは **おおまかな近接方向推定** です。
 マルチパス反射の影響で、近づいていても一時的にエネルギーが減ることがあるため、
 瞬間的な変化ではなく秒単位の低周波トレンドを見ます。
+
+---
+
+## Web Dashboard / Web ダッシュボード
+
+For a live view instead of terminal text, `csi_web_server.py` serves a local
+dashboard:
+
+```bash
+cd examples/get-started/tools
+uv run python csi_web_server.py -p /dev/ttyACM0
+# open http://127.0.0.1:8000/
+```
+
+The server owns the serial port and runs the same detectors as the command-line
+tools (`csi_detectors.py`), so the browser only renders: the detection logic is
+not reimplemented in JavaScript, and any browser works (Web Serial is not
+required). It needs only `numpy` and `pyserial`.
+
+| Option | Meaning |
+|--------|---------|
+| `-p`, `--port` / `-b`, `--baud` | CSI receiver board (default `/dev/ttyACM0` @ 921600) |
+| `--http-port` | port of the dashboard (default `8000`) |
+| `--host` | bind address (default `127.0.0.1`, localhost only) |
+| `--tool` | detector shown first: `motion`, `occupancy` or `proximity` |
+| `--replay FILE` | replay a `--csv` capture instead of reading the board |
+| `--synthetic` | generate a synthetic stream (development aid, no hardware) |
+
+The dashboard follows the OS light/dark preference (with a header toggle that
+overrides it), selects the detector through a radio group, announces status
+changes to screen readers and keeps its charts described in text. It shows the
+three detectors as a mode switch, one status badge
+(`有人` / `無人`, `1人（小動き）` / `複数人（ざわざわ）`, `近づいている` /
+`遠ざかっている` / `静止`), the score chart with its thresholds, the per-subcarrier
+amplitude of the latest packet, and a log of state transitions. Calibration
+seconds, window, EMA and the tool-specific metrics can be changed in the
+browser; applying a change restarts calibration for the new settings.
+
+`--replay` accepts any text file of raw `CSI_DATA` lines, including the
+`--csv` output of the tools, and loops it. `--synthetic` alternates an idle and
+a disturbed link, which is enough to exercise the whole pipeline without
+boards.
+
+ターミナル出力の代わりにブラウザで見たい場合は `csi_web_server.py` を使います。
+
+```bash
+cd examples/get-started/tools
+uv run python csi_web_server.py -p /dev/ttyACM0
+# http://127.0.0.1:8000/ を開く
+```
+
+サーバがシリアルポートを所有し、CLI ツールと同じ検出器（`csi_detectors.py`）を
+動かします。ブラウザは表示だけを担当するので、検出ロジックを JavaScript で
+二重実装せずに済み、Web Serial 非対応のブラウザでも動作します。必要なのは
+`numpy` と `pyserial` のみです。
+
+| オプション | 意味 |
+|-----------|------|
+| `-p`, `--port` / `-b`, `--baud` | CSI 受信機（既定 `/dev/ttyACM0` @ 921600） |
+| `--http-port` | ダッシュボードのポート（既定 `8000`） |
+| `--host` | バインド先（既定 `127.0.0.1`、ローカルのみ） |
+| `--tool` | 最初に表示する検出器（`motion` / `occupancy` / `proximity`） |
+| `--replay FILE` | 基板の代わりに `--csv` のキャプチャを再生 |
+| `--synthetic` | 合成ストリームを生成（開発用・実機不要） |
+
+画面は OS のライト／ダーク設定に追従し（ヘッダーのボタンで上書き可）、検出器は
+ラジオボタンで切り替えます。状態の変化はスクリーンリーダーに通知され、グラフには
+テキストの説明が付きます。状態バッジ（`有人` / `無人`、
+`1人（小動き）` / `複数人（ざわざわ）`、`近づいている` / `遠ざかっている` /
+`静止`）、スコアと閾値のグラフ、直近パケットのサブキャリア振幅、状態遷移の
+ログを表示します。キャリブレーション秒数・窓幅・EMA・各ツール固有の指標は
+ブラウザから変更でき、適用すると新しい設定でキャリブレーションをやり直します。
+
+`--replay` は生の `CSI_DATA` 行を含むテキストファイル（各ツールの `--csv` 出力を
+含む）をループ再生します。`--synthetic` は空室と動きのある状態を交互に生成する
+ので、実機なしで一連の動作を確認できます。
 
 ---
 

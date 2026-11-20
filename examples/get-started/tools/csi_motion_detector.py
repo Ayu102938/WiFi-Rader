@@ -13,6 +13,9 @@
 #   auto-calibration, EMA smoothing, hysteresis, and per-packet metrics CSV output.
 # - 2026-11-19: Moved line parsing, subcarrier selection, amplitude normalization,
 #   serial handling and the read loop to the shared csi_common module.
+# - 2026-11-19: Moved the detection state machine (window, calibration,
+#   hysteresis) to csi_detectors.MotionDetector so the web UI can drive the same
+#   detector; this script now only parses arguments and prints results.
 #
 """Real-time human presence detection from ESP-CSI serial output.
 
@@ -54,23 +57,10 @@ import argparse
 import csv
 import sys
 import time
-from collections import deque
 
-import numpy as np
-
-from csi_common import (Ema, PacketStats, Progress, SerialOpenError,
-                        SubcarrierSelector, csv_header, fmt_opt,
-                        iter_csi_packets, normalize_amplitude, open_serial)
-
-METRICS_COLUMNS = [
-    'timestamp', 'packet_num', 'raw_score', 'smoothed_score', 'status',
-    'rssi', 'baseline_mu', 'baseline_sigma', 'threshold_on', 'threshold_off',
-]
-
-STATUS_EMPTY = '無人'
-STATUS_OCCUPIED = '有人'
-STATUS_CALIBRATING = 'CALIBRATING'
-
+from csi_common import (PacketStats, Progress, SerialOpenError, csv_header,
+                        iter_csi_packets, open_serial)
+from csi_detectors import STATUS_CALIBRATING, MotionDetector
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
@@ -111,51 +101,15 @@ def build_arg_parser():
     return parser
 
 
-class Calibration:
-    """Collects idle scores and derives hysteresis thresholds from them."""
-
-    def __init__(self, seconds, min_packets):
-        self.seconds = seconds
-        self.min_packets = min_packets
-        self.scores = []
-        self.start = None
-
-    def start_now(self):
-        if self.start is None:
-            self.start = time.monotonic()
-
-    def add(self, score):
-        self.start_now()
-        self.scores.append(score)
-
-    def progress(self):
-        """Return ``(elapsed, fraction)`` for the calibration progress line."""
-        elapsed = 0.0 if self.start is None else time.monotonic() - self.start
-        fraction = 0.0
-        if self.seconds > 0:
-            fraction = min(1.0, elapsed / self.seconds)
-        return elapsed, fraction
-
-    def done(self):
-        if self.start is None:
-            return False
-        elapsed = time.monotonic() - self.start
-        return elapsed >= self.seconds and len(self.scores) >= self.min_packets
-
-    def result(self, on_sigma, off_sigma):
-        """Return ``(mu, sigma, threshold_on, threshold_off)``.
-
-        The smoothed score is used as the statistic, so sigma reflects the
-        noise of the value that is actually compared against the thresholds.
-        A floor keeps thresholds above the baseline in degenerate cases
-        (a perfectly still window would otherwise give sigma == 0).
-        """
-        arr = np.asarray(self.scores, dtype=np.float64)
-        mu = float(arr.mean()) if arr.size else 0.0
-        sigma = float(arr.std()) if arr.size else 0.0
-        # Guard against a zero/near-zero sigma: assume at least 2% relative jitter.
-        sigma = max(sigma, abs(mu) * 0.02, 1e-6)
-        return mu, sigma, mu + on_sigma * sigma, mu + off_sigma * sigma
+def show_calibration(progress, detector, metrics=None):
+    """Print the rate-limited calibration line (elapsed time, packets, score)."""
+    elapsed, fraction, samples = detector.calibration_progress()
+    score = ''
+    if metrics is not None and metrics['smoothed'] is not None:
+        score = ', score=%.4f' % metrics['smoothed']
+    progress.show('キャリブレーション中... %4.1f/%4.1fs (%3d%%, %d packets%s)'
+                  % (elapsed, detector.calibration.seconds,
+                     int(fraction * 100), samples, score))
 
 
 def main(argv=None):
@@ -197,29 +151,21 @@ def main(argv=None):
     if args.metrics_csv:
         metrics_file = open(args.metrics_csv, 'w', newline='')
         metrics_writer = csv.writer(metrics_file)
-        metrics_writer.writerow(METRICS_COLUMNS)
+        metrics_writer.writerow(MotionDetector.columns)
         metrics_file.flush()
 
-    window = deque(maxlen=args.window)
-    selector = SubcarrierSelector(args.subcarriers, args.edge_skip)
+    detector = MotionDetector(
+        window=args.window, calib=args.calib,
+        calib_min_packets=args.calib_min_packets, ema_alpha=args.ema_alpha,
+        on_sigma=args.on_sigma, off_sigma=args.off_sigma,
+        threshold=args.threshold, subcarriers=args.subcarriers,
+        edge_skip=args.edge_skip)
     stats = PacketStats()
-
-    ema = Ema(args.ema_alpha)
-    calibration = Calibration(args.calib, args.calib_min_packets)
     progress = Progress()
-    calibrated = args.threshold is not None
-    if calibrated:
-        mu = sigma = float('nan')
-        threshold_on = threshold_off = args.threshold
-    else:
-        mu = sigma = 0.0
-        threshold_on = threshold_off = 0.0
-
-    occupied = False
 
     print('Listening on %s @ %d baud (window=%d, edge-skip=%d, ema-alpha=%.2f)'
           % (args.port, args.baud, args.window, args.edge_skip, args.ema_alpha))
-    if calibrated:
+    if args.threshold is not None:
         print('Fixed threshold: %.3f (auto-calibration disabled)' % args.threshold)
     else:
         print('Calibrating idle baseline for %.1f s -- keep the room empty.'
@@ -229,12 +175,8 @@ def main(argv=None):
     try:
         for packet in iter_csi_packets(ser, stats):
             if packet is None:
-                if not calibrated:
-                    elapsed, fraction = calibration.progress()
-                    progress.show(
-                        'キャリブレーション中... %4.1f/%4.1fs (%3d%%, %d packets)'
-                        % (elapsed, calibration.seconds, int(fraction * 100),
-                           len(calibration.scores)))
+                if not detector.calibrated:
+                    show_calibration(progress, detector)
                 continue
 
             row, amplitude, rssi = packet
@@ -247,95 +189,45 @@ def main(argv=None):
                 csv_file.flush()
 
             try:
-                index = selector.indexes(amplitude.shape[0])
+                metrics = detector.update(amplitude, rssi)
             except argparse.ArgumentTypeError as exc:
                 print('\nerror: %s' % exc, file=sys.stderr)
                 return 2
-            # A changed subcarrier count means the radio re-tuned; restart.
-            if selector.changed:
-                window.clear()
-
-            normalized = normalize_amplitude(amplitude, index)
-            if normalized is None:
+            if metrics is None:
                 stats.skipped += 1
                 continue
-            window.append(normalized)
-
-            raw_score = None
-            if len(window) >= 2:
-                stack = np.asarray(window)
-                variance = stack.var(axis=0)
-                # Scale-free score: variance of the gain-normalized amplitude,
-                # averaged over the selected subcarriers.
-                raw_score = float(variance.mean())
-                ema.update(raw_score)
+            if metrics['score'] is not None:
                 stats.scored += 1
 
-            if not calibrated:
-                # The idle clock starts with the first usable score, so the
-                # displayed progress matches wall-clock observation time.
-                if raw_score is not None:
-                    calibration.start_now()
-                    # Only steady-state (full-window) scores feed the baseline;
-                    # short warm-up windows have inflated variance and would
-                    # bias the thresholds upward.
-                    if len(window) >= args.window:
-                        calibration.add(ema.value)
-                elapsed, fraction = calibration.progress()
+            if metrics['status'] == STATUS_CALIBRATING:
                 if metrics_writer is not None:
-                    metrics_writer.writerow([
-                        '%.3f' % timestamp, stats.packets,
-                        '' if raw_score is None else '%.6f' % raw_score,
-                        '' if ema.value is None else '%.6f' % ema.value,
-                        STATUS_CALIBRATING, rssi,
-                        '', '', '', '',
-                    ])
+                    metrics_writer.writerow(
+                        detector.csv_row(metrics, timestamp, stats.packets, rssi))
                     metrics_file.flush()
-                progress.show(
-                    'キャリブレーション中... %4.1f/%4.1fs (%3d%%, %d packets, '
-                    'score=%s)'
-                    % (elapsed, calibration.seconds, int(fraction * 100),
-                       len(calibration.scores),
-                       '-' if ema.value is None else '%.4f' % ema.value))
-                if calibration.done():
-                    mu, sigma, threshold_on, threshold_off = calibration.result(
-                        args.on_sigma, args.off_sigma)
-                    calibrated = True
+                show_calibration(progress, detector, metrics)
+                if metrics['calibrated_now']:
                     print('\nキャリブレーション完了: baseline mu=%.4f sigma=%.4f '
                           '-> on=%.4f off=%.4f (%d packets)'
-                          % (mu, sigma, threshold_on, threshold_off,
-                             len(calibration.scores)))
+                          % (metrics['mu'], metrics['sigma'],
+                             metrics['threshold_on'], metrics['threshold_off'],
+                             metrics['calib_samples']))
                 continue
 
-            if raw_score is None:
+            if metrics['status'] is None:
                 progress.show('収集中... (%d/%d packets)'
-                              % (len(window), args.window))
+                              % (metrics['window_fill'], metrics['window_size']))
                 continue
-
-            smoothed = ema.value
-
-            # Hysteresis: enter on the high threshold, leave on the low one.
-            if occupied:
-                if smoothed <= threshold_off:
-                    occupied = False
-            else:
-                if smoothed >= threshold_on:
-                    occupied = True
-            status = STATUS_OCCUPIED if occupied else STATUS_EMPTY
 
             if metrics_writer is not None:
-                metrics_writer.writerow([
-                    '%.3f' % timestamp, stats.packets,
-                    '%.6f' % raw_score, '%.6f' % smoothed, status, rssi,
-                    fmt_opt(mu), fmt_opt(sigma),
-                    '%.6f' % threshold_on, '%.6f' % threshold_off,
-                ])
+                metrics_writer.writerow(
+                    detector.csv_row(metrics, timestamp, stats.packets, rssi))
                 metrics_file.flush()
 
             print('\r%s  score=%8.4f  on=%7.4f  off=%7.4f  ema=%8.4f  '
                   'rssi=%4d  packets=%6d  skipped=%5d'
-                  % (status, raw_score, threshold_on, threshold_off, smoothed,
-                     rssi, stats.packets,
+                  % (metrics['status'], metrics['score'],
+                     metrics['threshold_on'], metrics['threshold_off'],
+                     metrics['smoothed'], rssi, stats.packets,
                      stats.skipped + stats.other_lines),
                   end='', flush=True)
 
