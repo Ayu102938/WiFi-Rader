@@ -168,11 +168,14 @@ class SubcarrierSelector:
         Raises ``argparse.ArgumentTypeError`` for an invalid ``--subcarriers``
         specification.
         """
-        self.changed = count != self._count
-        self._count = count
         if count not in self._cache:
+            # Resolve the spec first: it raises for an invalid --subcarriers
+            # value, and a selector that failed must not look like it moved on
+            # to a new subcarrier count.
             self._cache[count] = select_subcarriers(
                 count, self.spec, self.edge_skip)
+        self.changed = count != self._count
+        self._count = count
         return self._cache[count]
 
 
