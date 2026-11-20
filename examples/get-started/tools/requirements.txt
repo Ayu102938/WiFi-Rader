@@ -7,8 +7,6 @@
 # Data processing
 numpy
 pandas
-scipy
-statsmodels
 
 # Serial communication
 pyserial
@@ -19,3 +17,7 @@ PyQt5
 # Scientific plotting
 pyqtgraph
 matplotlib
+
+# Scientific computing
+scipy
+statsmodels
