@@ -263,6 +263,13 @@ class PacketStats:
         self.skipped = 0
         self.other_lines = 0
 
+    def reset(self):
+        """Forget all counts (used when the dashboard switches detector)."""
+        self.packets = 0
+        self.scored = 0
+        self.skipped = 0
+        self.other_lines = 0
+
     def summary(self):
         """Return the one-line end-of-run summary printed on Ctrl+C."""
         return ('%d packets parsed (%d scored), %d lines skipped, '
