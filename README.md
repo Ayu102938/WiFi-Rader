@@ -1,127 +1,68 @@
 # WiFi-Rader
 
-> **English** below, **日本語** はその後に記載しています。
+**English** · [日本語](README.ja.md)
 
-> This repository is a fork of [espressif/esp-csi](https://github.com/espressif/esp-csi),
-> which is licensed under the **Apache License, Version 2.0**.
->
-> Modified by **Ayu102938**:
-> - 2026-10-23: Disabled the `compensate_gain` log output in
->   `examples/get-started/csi_recv/main/app_main.c` to prevent the Python parser
->   from crashing on interleaved log lines.
-> - 2026-10-24: Enabled `CONFIG_FORCE_GAIN` in
->   `examples/get-started/csi_recv/main/app_main.c` to stabilize AGC/FFT gains
->   for presence detection.
-> - 2026-10-24: Created `examples/get-started/tools/csi_motion_detector.py`, a
->   real-time human-presence detector with per-packet normalization, automatic
->   calibration, EMA smoothing, hysteresis, and metrics CSV output.
-> - 2026-10-24: Created `examples/get-started/tools/csi_occupancy_meter.py`, a
->   three-level occupancy classifier that uses both motion magnitude and
->   fluctuation frequency to distinguish empty / one person / multiple people.
-> - 2026-10-24: Created `examples/get-started/tools/csi_proximity_meter.py`, a
->   coarse approach/departure detector based on absolute CSI energy trends.
-> - 2026-10-24: Rewrote this `README.md` as a setup guide for the WiFi-Rader
->   project.
-> - 2026-11-19: Moved the duplicated CSI front end of the three tools into
->   `examples/get-started/tools/csi_common.py`, and their per-packet state
->   machines into `csi_detectors.py`.
-> - 2026-11-19: Created `examples/get-started/tools/csi_web_server.py` and
->   `examples/get-started/tools/web/`, a local web dashboard that drives the
->   same detectors from a browser.
-> - 2026-11-19: Added the GUI viewer's missing `scipy` / `statsmodels` /
->   `matplotlib` dependencies to `requirements.txt`.
->
-> 本リポジトリは [espressif/esp-csi](https://github.com/espressif/esp-csi) を
-> **Apache License, Version 2.0** で Fork したものです。
->
-> **Ayu102938** による改変:
-> - 2026-10-23: Python パーサーがログ行にクラッシュしないよう、
->   `examples/get-started/csi_recv/main/app_main.c` の `compensate_gain` ログ出力を無効化。
-> - 2026-10-24: 在否検出の安定性向上のため、
->   `examples/get-started/csi_recv/main/app_main.c` の `CONFIG_FORCE_GAIN` を有効化。
-> - 2026-10-24: リアルタイム在否検出スクリプト
->   `examples/get-started/tools/csi_motion_detector.py` を新規作成。
->   振幅正規化、自動キャリブレーション、EMA 平滑化、ヒステリシス、metrics CSV 出力を実装。
-> - 2026-10-24: 3 段階混雑度分類スクリプト
->   `examples/get-started/tools/csi_occupancy_meter.py` を新規作成。
->   動きの大きさと変動頻度を組み合わせて、無人 / 1人 / 複数人を判定。
-> - 2026-10-24: 近接方向推定スクリプト
->   `examples/get-started/tools/csi_proximity_meter.py` を新規作成。
->   絶対エネルギーの時間変化から、近づいている / 遠ざかっている / 静止 を判定。
-> - 2026-10-24: 本 `README.md` を WiFi-Rader プロジェクトのセットアップガイドとして全面改稿。
+Wi-Fi CSI sensing with two ESP32 boards: a transmitter and a receiver measure how
+a person disturbs the wireless channel between them, and three detectors turn
+that into presence, occupancy and approach/departure.
 
----
+This repository is a fork of [espressif/esp-csi](https://github.com/espressif/esp-csi)
+(Apache License 2.0). What this fork adds and changes is listed under
+[Modifications](#modifications).
 
-## Overview / 概要
+> **日本語版は [README.ja.md](README.ja.md) にあります。**
 
-**WiFi-Rader** is a minimal Wi-Fi CSI (Channel State Information) sensing setup
-using two ESP32 devices: one sender (TX) and one receiver (RX). It detects human
-presence in real time by measuring how a person's body disturbs the wireless
-channel between the two devices.
+## What is here
 
-**WiFi-Rader** は、ESP32 を 2 台（送信機 TX / 受信機 RX）使った最小構成の
-Wi-Fi CSI（Channel State Information）センシング環境です。2 台の間を人が通ると
-無線チャネルが乱されることを利用し、リアルタイムで在否を検出します。
+| Piece | Role |
+|-------|------|
+| `examples/get-started/csi_send` | TX firmware: sends packets continuously |
+| `examples/get-started/csi_recv` | RX firmware: prints one `CSI_DATA` line per packet |
+| `examples/get-started/csi_recv_router` | Upstream variant that receives from a router instead of a TX board |
+| `examples/esp-radar/*`, `examples/esp-crab/*` | Upstream examples, kept as shipped |
 
-### What this fork adds / この Fork の追加機能
+`examples/get-started/tools/` holds the Python side:
 
-- Real-time presence detector (`csi_motion_detector.py`) with automatic calibration.
-- Gain-stabilized RX firmware for cleaner idle baseline.
-- Bilingual setup guide (EN/JP).
+| File | Role |
+|------|------|
+| `csi_common.py` | Shared front end: line parsing, subcarrier selection, amplitude normalisation, serial loop, progress, counters |
+| `csi_detectors.py` | The three detectors as classes (`MotionDetector`, `OccupancyMeter`, `ProximityMeter`) |
+| `csi_motion_detector.py` | CLI: occupied / empty |
+| `csi_occupancy_meter.py` | CLI: empty / one person / several people |
+| `csi_proximity_meter.py` | CLI: approaching / receding / still |
+| `csi_web_server.py` + `web/` | Local dashboard that runs the same detectors in a browser |
+| `csi_data_read_parse.py`, `csi_viewer.html` | Upstream GUI and browser CSI viewers (raw waveforms) |
 
-- 自動キャリブレーション付きリアルタイム在否検出スクリプト (`csi_motion_detector.py`)
-- クリーンなアイドル基線を得るためのゲイン固定 RX ファームウェア
-- 日英バイリンガルのセットアップガイド
+The CLI tools only parse arguments and print; the statistics live in
+`csi_detectors.py`, which is also what the web server imports. A fix to a
+detector therefore lands in every front end at once.
 
----
+## Hardware
 
-## Hardware Requirements / 必要な機材
-
-| Item | Recommended / 推奨 | Role / 役割 |
-|------|-------------------|-------------|
+| Item | Recommended | Role |
+|------|-------------|------|
 | ESP32-S3 | ESP32-S3-DevKitC or equivalent | RX (receiver) |
 | ESP32 (original) | ESP32-WROOM-U or equivalent | TX (sender) |
-| USB cables | 2 pcs | Power + data for RX, power for TX |
-| PC | Linux (tested on CachyOS/Arch x86_64) | Build, flash, and run detector |
+| USB cables | 2 | Power and data for RX, power for TX |
+| PC | Linux (tested on CachyOS/Arch x86_64) | Build, flash, run the tools |
 
-| 項目 | 推奨 | 役割 |
-|------|------|------|
-| ESP32-S3 | ESP32-S3-DevKitC など | RX（受信機） |
-| ESP32（オリジナル） | ESP32-WROOM-U など | TX（送信機） |
-| USB ケーブル | 2 本 | RX 用（電源＋データ）、TX 用（電源） |
-| PC | Linux（CachyOS/Arch x86_64 で動作確認） | ビルド・書き込み・検出実行 |
+Placement tips:
 
-### Placement tips / 配置のコツ
-
-- Keep **TX and RX 2–3 meters apart**.
+- Keep TX and RX **2–3 m apart**.
 - RSSI should settle around **-45 to -60 dBm**.
-- Avoid blocking the direct path completely; multipath helps sensitivity.
+- Do not block the direct path completely; multipath helps sensitivity.
 - An external IPEX antenna works better than the PCB antenna.
 
-- **TX と RX は 2〜3 m 離す**。
-- RSSI は **-45〜-60 dBm** 程度になる位置が目安。
-- 直接波を完全に遮らない方がよい。反射波（マルチパス）があると感度が上がる。
-- 外部 IPEX アンテナの方が PCB アンテナより性能が出やすい。
+## Software
 
----
-
-## Software Requirements / 必要なソフトウェア
-
-- **ESP-IDF** v5.5.6 (installed via `eim`)
-- **Python** 3.10–3.14
-- `eim` (Espressif Installation Manager)
-- `uv` for Python virtual environments
+- **ESP-IDF** v5.5.6, installed with `eim` (the standard `export.sh` is a bash
+  script and does not work with fish)
+- **Python** 3.10–3.14, with `uv` for the virtual environment
 - `git`
 
-Tested environment / 動作確認環境:
-- OS: CachyOS (Arch-based) x86_64
-- Shell: fish 4.9.3
-- Python: 3.14.8
-- mise, uv, docker
+Tested on CachyOS (Arch-based) x86_64, fish 4.9.3, Python 3.14.8.
 
----
-
-## Repository Setup / リポジトリの準備
+## Setup
 
 ```bash
 cd ~/Projects
@@ -129,37 +70,36 @@ git clone https://github.com/Ayu102938/WiFi-Rader.git
 cd WiFi-Rader
 ```
 
----
-
-## Installing ESP-IDF / ESP-IDF のインストール
-
-We use `eim` because the standard `export.sh` is a bash script and does not work
-with fish shell.
-
-`export.sh` は bash スクリプトなので fish では使えません。`eim` を使います。
+### ESP-IDF
 
 ```bash
-# Install ESP-IDF v5.5.6 with Xtensa toolchains for esp32 and esp32s3
+# Install v5.5.6 with the xtensa toolchains for esp32 and esp32s3
 eim install -p ~/esp -i v5.5.6 -t esp32,esp32s3 -n true
 
-# Verify / 確認
+# Verify
 eim list
 eim run "idf.py --version" v5.5.6
 ```
 
-If `eim` fails with `libwebkit2gtk-4.1.so.0`, install it:
+If `eim` fails on `libwebkit2gtk-4.1.so.0`, install it:
+`sudo pacman -S --needed webkit2gtk-4.1`.
 
-`eim` が `libwebkit2gtk-4.1.so.0` で失敗した場合:
+### Python environment
 
 ```bash
-sudo pacman -S --needed webkit2gtk-4.1
+cd examples/get-started/tools
+uv venv
+uv pip install numpy pyserial          # the three CLIs and the dashboard
+uv pip install -r requirements.txt     # only for the upstream GUI viewer
 ```
 
----
+`requirements.txt` covers `csi_data_read_parse.py` (pandas, scipy, statsmodels,
+PyQt5, pyqtgraph, matplotlib). The detectors and the dashboard need only
+`numpy` and `pyserial`.
 
-## Building and Flashing the Firmware / ファームウェアのビルドと書き込み
+## Firmware
 
-### RX — ESP32-S3 (receiver / 受信機)
+### RX — ESP32-S3
 
 ```bash
 cd examples/get-started/csi_recv
@@ -168,446 +108,220 @@ eim run "idf.py build" v5.5.6
 eim run "idf.py -p /dev/ttyACM0 -b 921600 flash" v5.5.6
 ```
 
-### TX — ESP32-WROOM-U (sender / 送信機)
+### TX — ESP32-WROOM-U
 
 ```bash
 cd examples/get-started/csi_send
 eim run "idf.py set-target esp32" v5.5.6
 eim run "idf.py build" v5.5.6
-
-# Connect the WROOM-U board, find its port, then flash
-# WROOM-U を接続し、ポートを確認してから書き込み
-ls -la /dev/ttyUSB*
 eim run "idf.py -p /dev/ttyUSB0 -b 921600 flash" v5.5.6
 ```
 
-> Note: The TX console baud rate is the ESP-IDF default (115200), while RX uses
-> 921600. If you monitor TX, use `-b 115200`.
->
-> TX のコンソールボーレートは ESP-IDF デフォルトの 115200、RX は 921600 です。
-> TX のモニタを見る場合は `-b 115200` を使ってください。
+The RX console runs at 921600 baud (`sdkconfig.defaults`); the TX console keeps
+the ESP-IDF default of 115200, so use `-b 115200` when you monitor TX.
 
----
-
-## Running the Presence Detector / 在否検出スクリプトの実行
-
-### 1. Prepare Python environment / Python 環境の準備
+## Presence detector
 
 ```bash
 cd examples/get-started/tools
-uv venv
-uv pip install numpy pyserial
-```
-
-For the original viewer with GUI, install all requirements instead:
-
-GUI 付きの元のビューワーを使う場合はすべてインストール:
-
-```bash
-uv pip install -r requirements.txt
-```
-
-### 2. Run / 実行
-
-```bash
 uv run python csi_motion_detector.py -p /dev/ttyACM0 --metrics-csv metrics.csv
 ```
 
-### 3. Calibrate / キャリブレーション
+1. Keep the room empty for the first **15 seconds**; the script prints the
+   baseline `mu` and `sigma` when calibration ends.
+2. Walk between TX and RX to trigger detection. `Ctrl+C` stops it.
 
-1. Keep the room empty for the first **15 seconds**.
-2. The script prints the baseline `mu` and `sigma`.
-3. After calibration, walk between TX and RX to test detection.
+The thresholds derive from that empty-room baseline:
 
-1. 最初の **15 秒間**、部屋に誰もいない状態にする。
-2. 基準値 `mu` と `sigma` が表示される。
-3. キャリブレーション完了後、TX と RX の間を歩いて検出を確認。
-
-### 4. Stop / 停止
-
-Press `Ctrl+C`.
-
----
-
-## Calibration Tips / キャリブレーションのコツ
-
-The detector uses the idle baseline to set thresholds automatically:
-
-```text
-有人 threshold = mu + 3 * sigma
-無人 threshold = mu + 1.5 * sigma
+```
+threshold_on  = mu + on_sigma  * sigma     (default 3.0)
+threshold_off = mu + off_sigma * sigma     (default 1.5)
 ```
 
-If you get false positives / 誤検知が多い場合:
+Too many false positives: `--on-sigma 6 --off-sigma 3`. Too sluggish:
+`--on-sigma 2 --off-sigma 1`. Other useful flags:
 
 ```bash
-uv run python csi_motion_detector.py -p /dev/ttyACM0 --on-sigma 6 --off-sigma 3
+uv run python csi_motion_detector.py -p /dev/ttyACM0 -w 300            # ~3 s window
+uv run python csi_motion_detector.py -p /dev/ttyACM0 --edge-skip 0     # all subcarriers
+uv run python csi_motion_detector.py -p /dev/ttyACM0 --ema-alpha 0.4   # faster EMA
+uv run python csi_motion_detector.py -p /dev/ttyACM0 --calib 10        # shorter calibration
+uv run python csi_motion_detector.py -p /dev/ttyACM0 -t 0.05           # fixed threshold, no calibration
 ```
 
-If the detector is too slow or misses motion / 反応が鈍い場合:
-
-```bash
-uv run python csi_motion_detector.py -p /dev/ttyACM0 --on-sigma 2 --off-sigma 1
-```
-
-Other useful options / その他のオプション:
-
-```bash
-# Larger window (3 s) / 大きな窓（3 秒）
-uv run python csi_motion_detector.py -p /dev/ttyACM0 -w 300
-
-# Use all subcarriers / 全サブキャリアを使用
-uv run python csi_motion_detector.py -p /dev/ttyACM0 --edge-skip 0
-
-# Faster EMA response / より素早い EMA 反応
-uv run python csi_motion_detector.py -p /dev/ttyACM0 --ema-alpha 0.4
-
-# Shorter calibration / 短いキャリブレーション
-uv run python csi_motion_detector.py -p /dev/ttyACM0 --calib 10
-```
-
----
-
-## CSV Output / CSV 出力
-
-Two CSV files can be produced:
-
-2 種類の CSV を出力できます:
-
-### Raw CSI packets / 生 CSI パケット
-
-```bash
-uv run python csi_motion_detector.py -p /dev/ttyACM0 --csv csi_capture.csv
-```
-
-Contains the same columns as `csi_data_read_parse.py`.
-
-`csi_data_read_parse.py` と同じ列を含みます。
-
-### Detection metrics / 検出指標
-
-```bash
-uv run python csi_motion_detector.py -p /dev/ttyACM0 --metrics-csv metrics.csv
-```
-
-Columns / 列:
-
-| Column | Description |
-|--------|-------------|
-| `timestamp` | Packet reception time |
-| `packet_num` | Sequential packet number |
-| `raw_score` | Unsmoothed motion score |
-| `smoothed_score` | EMA-smoothed score used for decisions |
-| `status` | `CALIBRATING`, `有人`, or `無人` |
-| `rssi` | Received signal strength indicator |
-| `baseline_mu` | Idle baseline mean after calibration |
-| `baseline_sigma` | Idle baseline standard deviation |
-| `threshold_on` | Threshold to enter occupied state |
-| `threshold_off` | Threshold to leave occupied state |
-
-| 列 | 説明 |
-|------|------|
-| `timestamp` | パケット受信時刻 |
-| `packet_num` | 連番 |
-| `raw_score` | 平滑化前の動きスコア |
-| `smoothed_score` | 判定に使われる EMA 平滑化後スコア |
-| `status` | `CALIBRATING` / `有人` / `無人` |
-| `rssi` | 受信信号強度 |
-| `baseline_mu` | キャリブレーション後のアイドル基線平均 |
-| `baseline_sigma` | アイドル基線の標準偏差 |
-| `threshold_on` | 有人に移行する閾値 |
-| `threshold_off` | 無人に戻る閾値 |
-
----
-
-## 3-Level Occupancy Meter / 3 段階混雑度メーター
-
-For a richer estimate than binary presence/absence, use `csi_occupancy_meter.py`.
-It combines the existing motion score with an **activity score** that measures
-how frequently the motion score fluctuates. This gives a three-level estimate:
-
-| Level | Meaning |
-|-------|---------|
-| 無人 | Empty room |
-| 1人（小動き） | One person, steady movement |
-| 複数人（ざわざわ） | Multiple people or bustling activity |
-
-在否検出よりも細かい情報が欲しい場合は `csi_occupancy_meter.py` を使います。
-既存の動きスコアに加えて、スコアの変動頻度を表す **アクティビティスコア** を
-組み合わせることで、3 段階の混雑度を推定します。
-
-| 段階 | 意味 |
-|------|------|
-| 無人 | 部屋に誰もいない |
-| 1人（小動き） | 1 人が規則的に動いている |
-| 複数人（ざわざわ） | 複数人または活発な動き |
-
-### Run / 実行
+## Occupancy meter
 
 ```bash
 uv run python csi_occupancy_meter.py -p /dev/ttyACM0 --metrics-csv occupancy.csv
 ```
 
-### Activity metrics / アクティビティ指標
+Adds an **activity score** on top of the motion score — how much the motion
+score itself fluctuates — and reports three levels: `無人` (empty),
+`1人（小動き）` (one person moving steadily), `複数人（ざわざわ）` (several people
+or vigorous activity). The activity label only flips after three consecutive
+packets on the new side.
 
-Choose the fluctuation metric with `--activity-metric`:
-
-| Metric | Description |
-|--------|-------------|
-| `cv` (default) | Coefficient of variation: std / mean of motion score over the activity window. Scale-free. |
-| `diff` | Standard deviation of first differences of motion score. |
-| `peaks` | Local maxima of motion score per second above `mean + 1σ`. |
-
-`--activity-metric` で変動の測り方を選べます:
-
-| 指標 | 説明 |
-|------|------|
-| `cv`（デフォルト） | 変動係数（標準偏差 ÷ 平均）。スケールに依存しない。 |
-| `diff` | 動きスコアの 1 階差分の標準偏差。 |
-| `peaks` | 1 秒あたりの局所的最大値の数（`平均 + 1σ` 以上）。 |
-
-### Example / 例
+| `--activity-metric` | Meaning |
+|---------------------|---------|
+| `cv` (default) | Coefficient of variation of the motion score; scale-free |
+| `diff` | Standard deviation of first differences of the motion score |
+| `peaks` | Local maxima per second above `mean + 1σ` |
 
 ```bash
-# Use the diff metric with an explicit threshold
-# diff 指標を使い、閾値を明示的に指定
 uv run python csi_occupancy_meter.py -p /dev/ttyACM0 \
-  --activity-metric diff --activity-threshold 0.2 \
-  --metrics-csv occupancy.csv
+  --activity-metric diff --activity-threshold 0.2 --metrics-csv occupancy.csv
 ```
 
-### Important limitation / 重要な制限
+This is an **activity-level estimator, not a people counter**: one person moving
+vigorously looks like several, several people standing still look empty.
 
-This is an **activity-level estimator**, not a people counter.
-A single person moving vigorously can look like multiple people, and several
-people standing still can look like an empty room.
-
-これは **活動度の推定** であり、正確な人数計測ではありません。
-1 人が激しく動けば複数人に見えるし、複数人が静止していれば無人に見えることがあります。
-
----
-
-## Approach / Departure Detection / 近づく・遠ざかる検出
-
-`csi_proximity_meter.py` tracks the **absolute received energy** (not the
-normalized motion score). When a person approaches the link, the received power
-generally rises; when they move away, it falls.
-
-`csi_proximity_meter.py` は **正規化していない受信エネルギー** を追跡します。
-人が TX-RX 間に近づくと受信電力が上がり、遠ざかると下がる傾向を利用して
-方向を推定します。
-
-### Run / 実行
+## Proximity meter
 
 ```bash
 uv run python csi_proximity_meter.py -p /dev/ttyACM0 --metrics-csv proximity.csv
 ```
 
-### Output / 出力
-
-| Direction | Meaning |
-|-----------|---------|
-| `近づいている` | Energy is rising (approaching) |
-| `遠ざかっている` | Energy is falling (moving away) |
-| `静止` | Energy is stable |
-
-| 方向 | 意味 |
-|------|------|
-| `近づいている` | エネルギーが上昇（近づいている） |
-| `遠ざかっている` | エネルギーが下降（遠ざかっている） |
-| `静止` | エネルギーが安定 |
-
-### Options / オプション
+Tracks the **absolute** received energy (not the normalised motion score) and
+reports `近づいている` / `遠ざかっている` / `静止` from the trend over
+`--trend-window` seconds. The default threshold is `3 * sigma` of the trend
+measured in an empty room.
 
 ```bash
-# Use amplitude instead of power
-# パワーではなく振幅でエネルギーを計算
 uv run python csi_proximity_meter.py -p /dev/ttyACM0 --energy-metric amplitude
-
-# Slower, steadier trend
-# よりゆっくり安定したトレンド
 uv run python csi_proximity_meter.py -p /dev/ttyACM0 --trend-window 3.0 --ema-alpha 0.1
 ```
 
-### Important limitation / 重要な制限
+Multipath can make energy drop while a person approaches, so this is a **coarse**
+direction estimate: recalibrate after moving either board.
 
-This is a **coarse proximity-direction estimator**. Multipath reflections can
-make energy decrease even when a person is approaching, so it looks at
-low-frequency trends over seconds, not instant-by-instant changes.
+## Web dashboard
 
-これは **おおまかな近接方向推定** です。
-マルチパス反射の影響で、近づいていても一時的にエネルギーが減ることがあるため、
-瞬間的な変化ではなく秒単位の低周波トレンドを見ます。
-
----
-
-## Web Dashboard / Web ダッシュボード
-
-For a live view instead of terminal text, `csi_web_server.py` serves a local
-dashboard:
+The same detectors, in a browser, served by a local process that owns the serial
+port:
 
 ```bash
 cd examples/get-started/tools
-uv run python csi_web_server.py -p /dev/ttyACM0
-# open http://127.0.0.1:8000/
+uv run python csi_web_server.py -p /dev/ttyACM0     # then open http://127.0.0.1:8000/
 ```
-
-The server owns the serial port and runs the same detectors as the command-line
-tools (`csi_detectors.py`), so the browser only renders: the detection logic is
-not reimplemented in JavaScript, and any browser works (Web Serial is not
-required). It needs only `numpy` and `pyserial`.
 
 | Option | Meaning |
 |--------|---------|
 | `-p`, `--port` / `-b`, `--baud` | CSI receiver board (default `/dev/ttyACM0` @ 921600) |
-| `--http-port` | port of the dashboard (default `8000`) |
-| `--host` | bind address (default `127.0.0.1`, localhost only) |
+| `--http-port` | dashboard port (default `8000`) |
+| `--host` | bind address (default `127.0.0.1`) |
 | `--tool` | detector shown first: `motion`, `occupancy` or `proximity` |
-| `--replay FILE` | replay a `--csv` capture instead of reading the board |
-| `--synthetic` | generate a synthetic stream (development aid, no hardware) |
+| `--replay FILE` | replay a capture instead of reading the board |
+| `--synthetic` | generate a synthetic stream (no hardware needed) |
+| `--replay-rate` | packets/s for `--replay` and `--synthetic` (default `100`) |
+| `--verbose` | log every HTTP request |
 
-The dashboard follows the OS light/dark preference (with a header toggle that
-overrides it), selects the detector through a radio group, announces status
-changes to screen readers and keeps its charts described in text. It shows the
-three detectors as a mode switch, one status badge
-(`有人` / `無人`, `1人（小動き）` / `複数人（ざわざわ）`, `近づいている` /
-`遠ざかっている` / `静止`), the score chart with its thresholds, the per-subcarrier
-amplitude of the latest packet, and a log of state transitions. Calibration
-seconds, window, EMA and the tool-specific metrics can be changed in the
-browser; applying a change restarts calibration for the new settings.
+The page switches between the three detectors, shows the score chart with its
+thresholds (for proximity: the trend and the `±threshold` band), the
+per-subcarrier amplitude of the latest packet, a log of state transitions and
+the packet counters. Calibration time, window, EMA and the tool-specific
+settings can be changed in the browser; applying restarts calibration.
 
-`--replay` accepts any text file of raw `CSI_DATA` lines, including the
-`--csv` output of the tools, and loops it. `--synthetic` alternates an idle and
-a disturbed link, which is enough to exercise the whole pipeline without
-boards.
+- **Light and dark**: follows the OS preference. The header button pins the
+  opposite scheme; pressing it again returns to following the system.
+- **Keyboard and screen readers**: the detector switch is a radio group, status
+  changes are announced through a live region, and the charts carry a text
+  summary of their current values.
+- **Local only**: the server binds to `127.0.0.1`. `--host 0.0.0.0` publishes an
+  unauthenticated dashboard *and* its config endpoint to the network, so use it
+  deliberately.
 
-ターミナル出力の代わりにブラウザで見たい場合は `csi_web_server.py` を使います。
+`--replay` accepts any text file of raw `CSI_DATA` lines — including the `--csv`
+output of the CLI tools — and loops it. `--synthetic` alternates 20 s of idle
+link with 8 s of disturbed link at 100 packets/s, which is enough to watch
+calibration, thresholds and status transitions without any board.
 
-```bash
-cd examples/get-started/tools
-uv run python csi_web_server.py -p /dev/ttyACM0
-# http://127.0.0.1:8000/ を開く
-```
+### Endpoints
 
-サーバがシリアルポートを所有し、CLI ツールと同じ検出器（`csi_detectors.py`）を
-動かします。ブラウザは表示だけを担当するので、検出ロジックを JavaScript で
-二重実装せずに済み、Web Serial 非対応のブラウザでも動作します。必要なのは
-`numpy` と `pyserial` のみです。
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /` | the dashboard (`web/index.html`, `style.css`, `app.js`) |
+| `GET /api/stream` | server-sent events: a full snapshot on connect, then one tick per new packet |
+| `GET /api/state` | the same snapshot as JSON |
+| `POST /api/config` | switch detector or retune parameters; invalid values answer `400` |
 
-| オプション | 意味 |
-|-----------|------|
-| `-p`, `--port` / `-b`, `--baud` | CSI 受信機（既定 `/dev/ttyACM0` @ 921600） |
-| `--http-port` | ダッシュボードのポート（既定 `8000`） |
-| `--host` | バインド先（既定 `127.0.0.1`、ローカルのみ） |
-| `--tool` | 最初に表示する検出器（`motion` / `occupancy` / `proximity`） |
-| `--replay FILE` | 基板の代わりに `--csv` のキャプチャを再生 |
-| `--synthetic` | 合成ストリームを生成（開発用・実機不要） |
+## CSV output
 
-画面は OS のライト／ダーク設定に追従し（ヘッダーのボタンで上書き可）、検出器は
-ラジオボタンで切り替えます。状態の変化はスクリーンリーダーに通知され、グラフには
-テキストの説明が付きます。状態バッジ（`有人` / `無人`、
-`1人（小動き）` / `複数人（ざわざわ）`、`近づいている` / `遠ざかっている` /
-`静止`）、スコアと閾値のグラフ、直近パケットのサブキャリア振幅、状態遷移の
-ログを表示します。キャリブレーション秒数・窓幅・EMA・各ツール固有の指標は
-ブラウザから変更でき、適用すると新しい設定でキャリブレーションをやり直します。
+`--csv FILE` writes the raw packets with the same columns as
+`csi_data_read_parse.py` (`type,id,mac,rssi,...,len,first_word,data`).
+`--metrics-csv FILE` writes one row per packet. All three tools share
+`timestamp`, `packet_num` and `rssi`; the rest differ:
 
-`--replay` は生の `CSI_DATA` 行を含むテキストファイル（各ツールの `--csv` 出力を
-含む）をループ再生します。`--synthetic` は空室と動きのある状態を交互に生成する
-ので、実機なしで一連の動作を確認できます。
+| Tool | Metric columns |
+|------|----------------|
+| motion | `raw_score`, `smoothed_score`, `status`, `baseline_mu`, `baseline_sigma`, `threshold_on`, `threshold_off` |
+| occupancy | `motion_score`, `smoothed_motion`, `activity_score`, `activity_metric`, `occupancy_level`, `baseline_mu`, `baseline_sigma`, `motion_threshold_on`, `motion_threshold_off`, `activity_threshold` |
+| proximity | `energy`, `smoothed_energy`, `trend`, `direction`, `energy_baseline_mu`, `energy_baseline_sigma`, `trend_threshold` |
 
----
+`status` is `CALIBRATING` while the baseline is being learned, then the Japanese
+label the tool prints.
 
-## How the Detection Works / 検出の仕組み
+## How the detection works
 
-1. **RX receives packets** from TX at 100 Hz.
-2. Each packet contains CSI: amplitude and phase for many subcarriers.
-3. **Per-packet normalization**: divide amplitudes by their mean, removing
-distance/gain dependence.
-4. **Score**: variance of the normalized amplitudes over a sliding window.
-5. **Auto-calibration**: learns idle `mu` and `sigma`.
-6. **Hysteresis**: stable transitions between 有人 and 無人.
+1. RX receives packets from TX at ~100 Hz; each `CSI_DATA` line carries the CSI
+   as interleaved `Q, I` pairs.
+2. **Per-packet normalisation**: amplitudes are divided by their own mean, which
+   removes gain and RSSI drift.
+3. **Score**: variance of the normalised amplitudes over a sliding window,
+   averaged over the subcarriers that carry signal (guard, DC and null
+   subcarriers are dropped).
+4. **Auto-calibration**: the empty-room scores give `mu`/`sigma`, and the
+   thresholds follow from them.
+5. **Hysteresis**: entering and leaving a state use different thresholds, so the
+   label does not chatter.
+6. **Subcarrier changes**: if the radio re-tunes and the subcarrier count
+   changes, the window and the smoothed values restart instead of reporting a
+   jump.
 
-1. RX が TX から 100 Hz でパケットを受信。
-2. 各パケットには多数のサブキャリアの振幅・位相（CSI）が含まれる。
-3. **パケットごとの正規化**: 振幅を平均で割り、距離・ゲイン依存を除去。
-4. **スコア**: 正規化振幅の分散を滑らかな窓で計算。
-5. **自動キャリブレーション**: アイドル時の `mu` と `sigma` を学習。
-6. **ヒステリシス**: 有人 / 無人を安定して切り替え。
+## Troubleshooting
 
----
+| Symptom | Cause and fix |
+|---------|---------------|
+| `cannot open /dev/ttyACM0` | Another process holds the port. Close `idf.py monitor` (`Ctrl+]`) first. |
+| `packets` stays at 0 | TX is not sending. Reset or power-cycle the TX board. |
+| Always `有人` | TX and RX too close: move them 2–3 m apart and recalibrate. |
+| Always `無人` | RSSI below -80 dBm, or thresholds too high: move the boards closer, lower `--on-sigma`. |
+| Wrong chip error while flashing | The build directory was configured for another target: run `set-target` again. |
+| Dashboard connects but never updates | The board is sending nothing, or the port is wrong. The page shows the server-side error once the serial link dies. |
+| `Address already in use` on `--http-port` | Another dashboard is running: pick another port or stop it. |
 
-## Troubleshooting / トラブルシューティング
+## Modifications
 
-### `cannot open /dev/ttyACM0`
+This fork started from `espressif/esp-csi` (Apache License 2.0). Changes by
+**Ayu102938**:
 
-Another process is holding the port. Close `idf.py monitor` first (`Ctrl+]`).
+- 2026-10-23 — `examples/get-started/csi_recv/main/app_main.c`: disabled the
+  `compensate_gain` log line so interleaved log output cannot break the parser.
+- 2026-10-24 — same file: enabled `CONFIG_FORCE_GAIN` to stabilise AGC/FFT gains.
+- 2026-10-24 — added `csi_motion_detector.py`, `csi_occupancy_meter.py` and
+  `csi_proximity_meter.py`.
+- 2026-11-19 — extracted `csi_common.py` (CSI front end) and `csi_detectors.py`
+  (detector state machines); the CLI tools now only parse arguments and print.
+- 2026-11-19 — added `csi_web_server.py` and `web/`: a local dashboard driving
+  the same detectors.
+- 2026-11-19 — rewrote this README as a setup guide and split it into
+  `README.md` (English) and `README.ja.md` (Japanese).
 
-他のプロセスがポートを占有しています。`idf.py monitor` を先に終了（`Ctrl+]`）。
+Each modified file also carries its change notice in the header.
 
-### `packets` stays at 0 / `packets` が 0 のまま
-
-TX is not sending. Reset or power-cycle TX.
-
-TX が送信していません。TX の電源を抜き差しまたはリセット。
-
-### Score always high, constant 有人 / スコアが常に高く有人判定
-
-- TX/RX may be too close. Move them 2–3 m apart.
-- Use auto-calibration and check `mu`/`sigma`.
-
-- TX/RX が近すぎる。2〜3 m 離す。
-- 自動キャリブレーションを使い、`mu`/`sigma` を確認。
-
-### Score always low, constant 無人 / スコアが常に低く無人判定
-
-- Check RSSI. If weaker than -80 dBm, move boards closer.
-- Lower `--on-sigma`.
-
-- RSSI を確認。-80 dBm より弱い場合は近づける。
-- `--on-sigma` を下げる。
-
-### Wrong chip error during flash / 書き込み時に chip mismatch
-
-You ran `idf.py` from a build directory configured for the wrong target.
-Run `idf.py set-target esp32s3` (RX) or `set-target esp32` (TX) again.
-
-`idf.py` を間違ったターゲットで設定されたビルドディレクトリから実行しています。
-RX は `set-target esp32s3`、TX は `set-target esp32` を再度実行。
-
----
-
-## Original Documentation / 元のドキュメント
-
-This fork retains the upstream documentation under `docs/` and
-`examples/*/README.md`.
-
-本 Fork では元のドキュメント `docs/` および `examples/*/README.md` を残しています。
+## Original documentation
 
 - [Signal Processing Fundamentals](./docs/en/Signal-Processing-Fundamentals.md)
 - [OFDM Introduction](./docs/en/OFDM-introduction.md)
 - [Wireless Channel Fundamentals](./docs/en/Wireless-Channel-Fundamentals.md)
 
----
+The upstream examples keep their own `README.md` under `examples/*/`.
 
-## License / ライセンス
+## License
 
-This project is licensed under the **Apache License, Version 2.0**, the same as
-the upstream [espressif/esp-csi](https://github.com/espressif/esp-csi) project.
+Apache License 2.0, the same as [espressif/esp-csi](https://github.com/espressif/esp-csi).
+See [LICENSE](./LICENSE).
 
-See [LICENSE](./LICENSE) for the full text.
+## Contributing
 
-本プロジェクトは上流の
-[espressif/esp-csi](https://github.com/espressif/esp-csi) と同じく
-**Apache License, Version 2.0** でライセンスされています。
-
-全文は [LICENSE](./LICENSE) を参照してください。
-
----
-
-## Contributing / 貢献
-
-If you modify existing files, please add a modification notice near the top of
-the file to comply with Apache License 2.0 Section 4(b).
-
-既存ファイルを変更する場合、Apache License 2.0 第 4 条 (b) に従い、
-ファイル先頭に変更通知を追加してください。
+When you modify an existing file, add a modification notice near its top, as
+Apache License 2.0 section 4(b) requires.
